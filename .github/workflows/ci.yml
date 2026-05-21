@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  # `ippoan/ci-workflows/.github/workflows/go-ci.yml` の 3 job (vet / test /
+  # build) を `ci` job id 配下に呼び出す。status check 名は caller job id
+  # + ' / ' + reusable job name で:
+  #   - ci / vet
+  #   - ci / test
+  #   - ci / build
+  # これは auth-worker の `ippoan-go-default` branch protection preset と
+  # ピン留めされている (preset 側を変えるならここの job 名と reusable
+  # 側の job 名を同時に動かす)。
+  ci:
+    if: github.event.pull_request.draft != true
+    uses: ippoan/ci-workflows/.github/workflows/go-ci.yml@main
+
+  # 親 repo (secrets-inventory) と揃えて staging を実運用環境にする。
+  # main push と非 draft PR の両方で同じ staging service に deploy する。
+  #
+  # rust-alc-api 等の既存 ippoan deploy パターンに合わせて、deploy
+  # credential は staging-deploy 用 SA の JSON key を repository secret
+  # `GCP_DEPLOY_SA_KEY_STAGING` に保存して使う。GCP 側 setup (deployer
+  # SA + key 発行 + Cloud Run service + runtime SA + Google Secret
+  # Manager の shared secret) が終わって `vars.GCP_PROJECT_ID_STAGING`
+  # が repository variable に入るまでは job ごと skip して PR の必須
+  # check (= ci / *) は ci job が green ならそのまま通る。
+  deploy-staging:
+    if: |
+      vars.GCP_PROJECT_ID_STAGING != '' && (
+        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'pull_request' && github.event.pull_request.draft != true)
+      )
+    needs: [ci]
+    runs-on: ubuntu-latest
+    environment: staging
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: 'google-github-actions/auth@v2'
+        with:
+          credentials_json: ${{ secrets.GCP_DEPLOY_SA_KEY_STAGING }}
+      - uses: 'google-github-actions/setup-gcloud@v2'
+      - name: Deploy to Cloud Run (staging)
+        run: |
+          gcloud run deploy "${SERVICE}" \
+            --project "${PROJECT}" \
+            --region "${REGION}" \
+            --source . \
+            --service-account "${RUNTIME_SA}" \
+            --allow-unauthenticated \
+            --ingress all \
+            --set-env-vars "GCP_PROJECT_ID=${PROJECT}" \
+            --update-secrets "INVENTORY_API_KEY=${API_KEY_SECRET}:latest" \
+            --quiet
+        env:
+          SERVICE: secrets-inventory-gcp-staging
+          PROJECT: ${{ vars.GCP_PROJECT_ID_STAGING }}
+          REGION: ${{ vars.GCP_REGION }}
+          RUNTIME_SA: ${{ vars.GCP_RUNTIME_SA_STAGING }}
+          API_KEY_SECRET: ${{ vars.GCP_API_KEY_SECRET_STAGING }}
+
+  # production は v* タグでのみ deploy。当面は予約のみで未稼働の想定。
+  # staging と同じく project_id variable が未設定の間は skip する。
+  deploy-production:
+    if: |
+      vars.GCP_PROJECT_ID != '' && startsWith(github.ref, 'refs/tags/v')
+    needs: [ci]
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: 'google-github-actions/auth@v2'
+        with:
+          credentials_json: ${{ secrets.GCP_DEPLOY_SA_KEY }}
+      - uses: 'google-github-actions/setup-gcloud@v2'
+      - name: Deploy to Cloud Run (production)
+        run: |
+          gcloud run deploy "${SERVICE}" \
+            --project "${PROJECT}" \
+            --region "${REGION}" \
+            --source . \
+            --service-account "${RUNTIME_SA}" \
+            --allow-unauthenticated \
+            --ingress all \
+            --set-env-vars "GCP_PROJECT_ID=${PROJECT}" \
+            --update-secrets "INVENTORY_API_KEY=${API_KEY_SECRET}:latest" \
+            --quiet
+        env:
+          SERVICE: secrets-inventory-gcp
+          PROJECT: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION }}
+          RUNTIME_SA: ${{ vars.GCP_RUNTIME_SA }}
+          API_KEY_SECRET: ${{ vars.GCP_API_KEY_SECRET }}
