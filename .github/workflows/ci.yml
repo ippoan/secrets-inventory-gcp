@@ -1,4 +1,4 @@
-name: deploy
+name: CI
 
 on:
   push:
@@ -12,36 +12,36 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  # `ippoan/ci-workflows/.github/workflows/go-ci.yml` の 3 job (vet / test /
+  # build) を `ci` job id 配下に呼び出す。status check 名は caller job id
+  # + ' / ' + reusable job name で:
+  #   - ci / vet
+  #   - ci / test
+  #   - ci / build
+  # これは auth-worker の `ippoan-go-default` branch protection preset と
+  # ピン留めされている (preset 側を変えるならここの job 名と reusable
+  # 側の job 名を同時に動かす)。
+  ci:
     if: github.event.pull_request.draft != true
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-      - run: go vet ./...
-      - run: go test ./...
-      - run: go build -o /tmp/server .
+    uses: ippoan/ci-workflows/.github/workflows/go-ci.yml@main
 
+  # 親 repo (secrets-inventory) と揃えて staging を実運用環境にする。
+  # main push と非 draft PR の両方で同じ staging service に deploy する。
+  #
+  # rust-alc-api 等の既存 ippoan deploy パターンに合わせて、deploy
+  # credential は staging-deploy 用 SA の JSON key を repository secret
+  # `GCP_DEPLOY_SA_KEY_STAGING` に保存して使う。GCP 側 setup (deployer
+  # SA + key 発行 + Cloud Run service + runtime SA + Google Secret
+  # Manager の shared secret) が終わって `vars.GCP_PROJECT_ID_STAGING`
+  # が repository variable に入るまでは job ごと skip して PR の必須
+  # check (= ci / *) は ci job が green ならそのまま通る。
   deploy-staging:
-    # 親 repo (secrets-inventory) と揃えて staging を実運用環境にする。
-    # main push と非 draft PR の両方で同じ staging service に deploy する。
-    #
-    # rust-alc-api 等の既存 ippoan deploy パターンに合わせて、deploy
-    # credential は staging-deploy 用 SA の JSON key を repository secret
-    # `GCP_DEPLOY_SA_KEY_STAGING` に保存して使う。GCP 側 setup (deployer
-    # SA + key 発行 + Cloud Run service + runtime SA + Google Secret
-    # Manager の shared secret) が終わって `vars.GCP_PROJECT_ID_STAGING`
-    # が repository variable に入るまでは job ごと skip して PR の必須
-    # check を green に保つ。
     if: |
       vars.GCP_PROJECT_ID_STAGING != '' && (
         (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
         (github.event_name == 'pull_request' && github.event.pull_request.draft != true)
       )
-    needs: [test]
+    needs: [ci]
     runs-on: ubuntu-latest
     environment: staging
     concurrency:
@@ -72,12 +72,12 @@ jobs:
           RUNTIME_SA: ${{ vars.GCP_RUNTIME_SA_STAGING }}
           API_KEY_SECRET: ${{ vars.GCP_API_KEY_SECRET_STAGING }}
 
+  # production は v* タグでのみ deploy。当面は予約のみで未稼働の想定。
+  # staging と同じく project_id variable が未設定の間は skip する。
   deploy-production:
-    # production は v* タグでのみ deploy。当面は予約のみで未稼働の想定。
-    # staging と同じく project_id variable が未設定の間は skip する。
     if: |
       vars.GCP_PROJECT_ID != '' && startsWith(github.ref, 'refs/tags/v')
-    needs: [test]
+    needs: [ci]
     runs-on: ubuntu-latest
     environment: production
     concurrency:
