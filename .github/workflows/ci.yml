@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  packages: write   # build-image で GHCR push に必要
 
 jobs:
   # `ippoan/ci-workflows/.github/workflows/go-ci.yml` の 3 job (vet / test /
@@ -18,92 +19,93 @@ jobs:
   #   - ci / vet
   #   - ci / test
   #   - ci / build
-  # これは auth-worker の `ippoan-go-default` branch protection preset と
-  # ピン留めされている (preset 側を変えるならここの job 名と reusable
-  # 側の job 名を同時に動かす)。
+  # auth-worker の `ippoan-go-default` branch protection preset とピン留め
+  # されているので、preset 側 unit test と本 job 構成は対の契約として扱う。
   ci:
     if: github.event.pull_request.draft != true
     uses: ippoan/ci-workflows/.github/workflows/go-ci.yml@main
 
-  # 親 repo (secrets-inventory) と揃えて staging を実運用環境にする。
-  # main push と非 draft PR の両方で同じ staging service に deploy する。
+  # GHCR への image push。non-draft PR と main push、v* tag push で走る。
+  # ippoan の Cloud Run deploy 標準パターン (ci-workflows/cloud-run-
+  # deploy.yml の comment 参照) は GHCR → AR remote-repo の pull-through
+  # cache 経由で digest pin deploy するため、ここで GHCR に上げておく。
+  # image tag は github.sha (short) で固定 — deploy 側で digest を解決する
+  # ので tag のスタブ性は問題にならない。
+  build-image:
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) ||
+      (github.event_name == 'pull_request' && github.event.pull_request.draft != true)
+    needs: [ci]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        run: echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/ippoan/secrets-inventory-gcp:${{ steps.meta.outputs.tag }}
+            ghcr.io/ippoan/secrets-inventory-gcp:latest
+
+  # staging deploy: ci-workflows の cloud-run-deploy.yml reusable を呼ぶ。
+  # AR remote-repo `cloudsql-sv/ghcr` (daiun-salary 等と共有、既存) 経由で
+  # digest pin した image を Cloud Run staging service に流す。
   #
-  # rust-alc-api 等の既存 ippoan deploy パターンに合わせて、deploy
-  # credential は staging-deploy 用 SA の JSON key を repository secret
-  # `GCP_DEPLOY_SA_KEY_STAGING` に保存して使う。GCP 側 setup (deployer
-  # SA + key 発行 + Cloud Run service + runtime SA + Google Secret
-  # Manager の shared secret) が終わって `vars.GCP_PROJECT_ID_STAGING`
-  # が repository variable に入るまでは job ごと skip して PR の必須
-  # check (= ci / *) は ci job が green ならそのまま通る。
+  # Cloud Run service `secrets-inventory-gcp-staging` は **既存前提** で、
+  # reusable は services update を叩く。初回 service 作成は user が手動で
+  # `gcloud run deploy --image ... --service-account
+  # secrets-inventory-viewer@cloudsql-sv.iam.gserviceaccount.com` で 1 回
+  # 作っておくこと (CLAUDE.md 参照)。
+  #
+  # GCP setup 未完了の間は vars が空で skip され、PR の必須 check は
+  # `ci / *` の 3 つだけで通る。
   deploy-staging:
     if: |
       vars.GCP_PROJECT_ID_STAGING != '' && (
         (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
         (github.event_name == 'pull_request' && github.event.pull_request.draft != true)
       )
-    needs: [ci]
-    runs-on: ubuntu-latest
-    environment: staging
-    concurrency:
-      group: deploy-staging
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@v4
-      - uses: 'google-github-actions/auth@v2'
-        with:
-          credentials_json: ${{ secrets.GCP_DEPLOY_SA_KEY_STAGING }}
-      - uses: 'google-github-actions/setup-gcloud@v2'
-      - name: Deploy to Cloud Run (staging)
-        run: |
-          gcloud run deploy "${SERVICE}" \
-            --project "${PROJECT}" \
-            --region "${REGION}" \
-            --source . \
-            --service-account "${RUNTIME_SA}" \
-            --allow-unauthenticated \
-            --ingress all \
-            --set-env-vars "GCP_PROJECT_ID=${PROJECT}" \
-            --update-secrets "INVENTORY_API_KEY=${API_KEY_SECRET}:latest" \
-            --quiet
-        env:
-          SERVICE: secrets-inventory-gcp-staging
-          PROJECT: ${{ vars.GCP_PROJECT_ID_STAGING }}
-          REGION: ${{ vars.GCP_REGION }}
-          RUNTIME_SA: ${{ vars.GCP_RUNTIME_SA_STAGING }}
-          API_KEY_SECRET: ${{ vars.GCP_API_KEY_SECRET_STAGING }}
+    needs: [ci, build-image]
+    uses: ippoan/ci-workflows/.github/workflows/cloud-run-deploy.yml@main
+    with:
+      service: secrets-inventory-gcp-staging
+      region: ${{ vars.GCP_REGION }}
+      project: ${{ vars.GCP_PROJECT_ID_STAGING }}
+      ghcr_image: ghcr.io/ippoan/secrets-inventory-gcp
+      image_tag: ${{ needs.build-image.outputs.image_tag }}
+      ar_repo: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_STAGING }}/ghcr/ippoan/secrets-inventory-gcp
+    secrets:
+      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
 
-  # production は v* タグでのみ deploy。当面は予約のみで未稼働の想定。
-  # staging と同じく project_id variable が未設定の間は skip する。
+  # production は v* タグでのみ deploy。staging-deploy SA を流用する想定。
+  # 別 SA に分けたい場合は repo secret `GCP_SA_KEY_PROD` 等を追加して
+  # 切り替える (将来必要になった時の判断)。
   deploy-production:
     if: |
       vars.GCP_PROJECT_ID != '' && startsWith(github.ref, 'refs/tags/v')
-    needs: [ci]
-    runs-on: ubuntu-latest
-    environment: production
-    concurrency:
-      group: deploy-production
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@v4
-      - uses: 'google-github-actions/auth@v2'
-        with:
-          credentials_json: ${{ secrets.GCP_DEPLOY_SA_KEY }}
-      - uses: 'google-github-actions/setup-gcloud@v2'
-      - name: Deploy to Cloud Run (production)
-        run: |
-          gcloud run deploy "${SERVICE}" \
-            --project "${PROJECT}" \
-            --region "${REGION}" \
-            --source . \
-            --service-account "${RUNTIME_SA}" \
-            --allow-unauthenticated \
-            --ingress all \
-            --set-env-vars "GCP_PROJECT_ID=${PROJECT}" \
-            --update-secrets "INVENTORY_API_KEY=${API_KEY_SECRET}:latest" \
-            --quiet
-        env:
-          SERVICE: secrets-inventory-gcp
-          PROJECT: ${{ vars.GCP_PROJECT_ID }}
-          REGION: ${{ vars.GCP_REGION }}
-          RUNTIME_SA: ${{ vars.GCP_RUNTIME_SA }}
-          API_KEY_SECRET: ${{ vars.GCP_API_KEY_SECRET }}
+    needs: [ci, build-image]
+    uses: ippoan/ci-workflows/.github/workflows/cloud-run-deploy.yml@main
+    with:
+      service: secrets-inventory-gcp
+      region: ${{ vars.GCP_REGION }}
+      project: ${{ vars.GCP_PROJECT_ID }}
+      ghcr_image: ghcr.io/ippoan/secrets-inventory-gcp
+      image_tag: ${{ needs.build-image.outputs.image_tag }}
+      ar_repo: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/ghcr/ippoan/secrets-inventory-gcp
+    secrets:
+      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}

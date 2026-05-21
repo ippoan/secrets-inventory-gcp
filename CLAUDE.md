@@ -56,41 +56,82 @@ PR を上げると staging に auto-deploy される。production は当面未�
 
 ## デプロイ
 
-GitHub Actions 経由で `google-github-actions/auth@v2` の `credentials_json`
-モードを使う。**rust-alc-api 等の既存 ippoan deploy パターンと揃える**。
-deployer 用 SA の JSON key を repository secret に保存し、`gcloud run deploy`
-を回す。
+ippoan の Cloud Run deploy 標準パターンに揃える: caller workflow で
+**Docker build + GHCR push** → `ippoan/ci-workflows/.github/workflows/
+cloud-run-deploy.yml` reusable で **AR remote-repo (pull-through cache)
+経由で digest-pinned deploy**。
 
 > 「GCP key 0 個運用」は **runtime credential** (Cloud Run → Secret Manager)
 > の話で、Cloud Run の attached SA + ADC により維持される。deploy
-> credential (GitHub Actions → GCP) は別の境界で、ここは既存 repo と同じく
-> deployer SA の JSON key 方式に揃える。
+> credential (GitHub Actions → GCP) は別の境界で、ippoan 既存 repo
+> (`rust-alc-api` 等) と同じく **`staging-deploy@cloudsql-sv` SA の
+> JSON key を repo secret `GCP_SA_KEY`** に登録する方式に揃える。
 
-GCP 側の事前 setup (`secrets-inventory-gcp` issue #1 参照):
+### GCP 側 (one-time、`cloudsql-sv` project)
 
-- `cloud-run-deployer-staging` / `cloud-run-deployer` SA (deploy 用、JSON
-  key を発行して GitHub repo secret に登録)
-- `secrets-inventory-runtime-staging` / `secrets-inventory-runtime` SA
-  (Cloud Run attached、`roles/secretmanager.viewer` のみ)
-- shared secret (32 byte) を Google Secret Manager に格納
-- 同値を Cloudflare Secrets Store にも投入 (親 repo 側)
+既存 SA をできるだけ流用する。
 
-GitHub repo 側に登録するもの (Settings → Secrets and variables → Actions):
+- **Deployer**: `staging-deploy@cloudsql-sv.iam.gserviceaccount.com`
+  (既存、ippoan 横断 staging deployer)
+- **Runtime (Cloud Run attached)**: `secrets-inventory-viewer@cloudsql-sv.iam.gserviceaccount.com`
+  (既存、`roles/secretmanager.viewer` を持つことを確認。**JSON key は
+  発行しない** = ADC 経由で取る)
+- **AR remote-repo**: `asia-northeast1-docker.pkg.dev/cloudsql-sv/ghcr/`
+  (既存、daiun-salary 等と共有。`ippoan/secrets-inventory-gcp` という
+  path で同 remote-repo に乗る)
+- **Shared API key**: Google Secret Manager に
+  `SECRETS_INVENTORY_GCP_PROXY_API_KEY_STAGING` (staging) /
+  `SECRETS_INVENTORY_GCP_PROXY_API_KEY` (prod) を新規作成
+  + `secrets-inventory-viewer` SA に `roles/secretmanager.secretAccessor`
+  を **この secret 限定で** 付与
+- 同値を親 repo (`ippoan/secrets-inventory`) の Cloudflare Secrets Store
+  にも投入
 
-**Secrets (encrypted):**
+### Cloud Run service の初回作成 (user 手動)
 
-- `GCP_DEPLOY_SA_KEY_STAGING`: staging deployer SA の JSON key (rotation 対象)
-- `GCP_DEPLOY_SA_KEY`: production deployer SA の JSON key
+`cloud-run-deploy.yml` reusable は `gcloud run services update --image`
+を叩く設計で、**service が既存前提**。1 回だけ user が手動で作成:
 
-**Variables (plain text):**
+```bash
+PROJECT_STAGING="cloudsql-sv"
+REGION="asia-northeast1"
+RUNTIME_SA="secrets-inventory-viewer@cloudsql-sv.iam.gserviceaccount.com"
 
-- `GCP_REGION`: deploy region (例: `asia-northeast1`)
-- staging: `GCP_PROJECT_ID_STAGING` / `GCP_RUNTIME_SA_STAGING` / `GCP_API_KEY_SECRET_STAGING`
-- production: `GCP_PROJECT_ID` / `GCP_RUNTIME_SA` / `GCP_API_KEY_SECRET`
+gcloud run deploy secrets-inventory-gcp-staging \
+  --project="$PROJECT_STAGING" \
+  --region="$REGION" \
+  --image="asia-northeast1-docker.pkg.dev/$PROJECT_STAGING/ghcr/ippoan/secrets-inventory-gcp:latest" \
+  --service-account="$RUNTIME_SA" \
+  --allow-unauthenticated \
+  --ingress=all \
+  --set-env-vars="GCP_PROJECT_ID=$PROJECT_STAGING" \
+  --update-secrets="INVENTORY_API_KEY=SECRETS_INVENTORY_GCP_PROXY_API_KEY_STAGING:latest"
+```
 
-`vars.GCP_PROJECT_ID_STAGING` / `vars.GCP_PROJECT_ID` が空のあいだは workflow
-の deploy job が `if:` で skip される (PR の必須 check は通る)。setup 完了後
-に variable を入れた瞬間 deploy が動き始める。
+これ以降は workflow が image を update する。
+
+### GitHub repo 側 (Settings → Secrets and variables → Actions)
+
+**Secrets (encrypted, repo-level):**
+
+- `GCP_SA_KEY`: `staging-deploy@cloudsql-sv` SA の JSON key 全文
+  (`rust-alc-api` 等と同名、reusable の固定名)
+
+**Variables (plain text, repo-level):**
+
+- `GCP_REGION` = `asia-northeast1`
+- `GCP_PROJECT_ID_STAGING` = `cloudsql-sv`
+- (production を動かす段階で `GCP_PROJECT_ID` も追加)
+
+`vars.GCP_PROJECT_ID_STAGING` が空のあいだは workflow の deploy job が
+`if:` で skip される (PR の必須 check `ci / vet` / `ci / test` /
+`ci / build` だけで通る)。setup 完了後に variable を入れた瞬間 deploy
+が動き始める。
+
+org-level に寄せるか repo-level に置くかは値の性質次第:
+
+- `GCP_REGION` / `GCP_SA_KEY` (org 横断 deployer) → org 推奨
+- `GCP_PROJECT_ID_STAGING` も service 全部が `cloudsql-sv` なら org 可
 
 ## ローカル開発
 
