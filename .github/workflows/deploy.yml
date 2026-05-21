@@ -28,15 +28,22 @@ jobs:
   deploy-staging:
     # 親 repo (secrets-inventory) と揃えて staging を実運用環境にする。
     # main push と非 draft PR の両方で同じ staging service に deploy する。
+    #
+    # rust-alc-api 等の既存 ippoan deploy パターンに合わせて、deploy
+    # credential は staging-deploy 用 SA の JSON key を repository secret
+    # `GCP_DEPLOY_SA_KEY_STAGING` に保存して使う。GCP 側 setup (deployer
+    # SA + key 発行 + Cloud Run service + runtime SA + Google Secret
+    # Manager の shared secret) が終わって `vars.GCP_PROJECT_ID_STAGING`
+    # が repository variable に入るまでは job ごと skip して PR の必須
+    # check を green に保つ。
     if: |
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'pull_request' && github.event.pull_request.draft != true)
+      vars.GCP_PROJECT_ID_STAGING != '' && (
+        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'pull_request' && github.event.pull_request.draft != true)
+      )
     needs: [test]
     runs-on: ubuntu-latest
     environment: staging
-    permissions:
-      contents: read
-      id-token: write
     concurrency:
       group: deploy-staging
       cancel-in-progress: false
@@ -44,8 +51,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: 'google-github-actions/auth@v2'
         with:
-          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
-          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+          credentials_json: ${{ secrets.GCP_DEPLOY_SA_KEY_STAGING }}
       - uses: 'google-github-actions/setup-gcloud@v2'
       - name: Deploy to Cloud Run (staging)
         run: |
@@ -68,13 +74,12 @@ jobs:
 
   deploy-production:
     # production は v* タグでのみ deploy。当面は予約のみで未稼働の想定。
-    if: startsWith(github.ref, 'refs/tags/v')
+    # staging と同じく project_id variable が未設定の間は skip する。
+    if: |
+      vars.GCP_PROJECT_ID != '' && startsWith(github.ref, 'refs/tags/v')
     needs: [test]
     runs-on: ubuntu-latest
     environment: production
-    permissions:
-      contents: read
-      id-token: write
     concurrency:
       group: deploy-production
       cancel-in-progress: false
@@ -82,8 +87,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: 'google-github-actions/auth@v2'
         with:
-          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
-          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+          credentials_json: ${{ secrets.GCP_DEPLOY_SA_KEY }}
       - uses: 'google-github-actions/setup-gcloud@v2'
       - name: Deploy to Cloud Run (production)
         run: |

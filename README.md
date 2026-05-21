@@ -29,7 +29,7 @@ GCP Service Account の JSON key (~2KB) は Cloudflare Secrets Store の 1024 by
 ## 別 repo にした理由
 
 - 本 repo は **Go service**、親 repo は TypeScript Worker。CI / build / dependency が完全に独立
-- Cloud Run の deploy 単位と GitHub repo を 1:1 にする方が WIF (Workload Identity Federation) の subject 紐付けがシンプル (`repo:ippoan/secrets-inventory-gcp:ref:refs/heads/main`)
+- Cloud Run の deploy 単位と GitHub repo を 1:1 にすると、deployer SA の権限境界 / rotation 計画 / Actions ログが repo と完全一致するので運用が分かりやすい (rust-alc-api 等の既存 ippoan deploy パターンと同じ思想)
 - subdirectory pattern (`cloud-run/`) も検討したが、別 repo の方が運用境界が明確
 
 ## 環境構成
@@ -52,12 +52,16 @@ GCP Service Account の JSON key (~2KB) は Cloudflare Secrets Store の 1024 by
 
 ## GCP 側 setup (one-time)
 
-詳細は [issue (TBD)](https://github.com/ippoan/secrets-inventory-gcp/issues) を参照。要点:
+詳細は [issue #1](https://github.com/ippoan/secrets-inventory-gcp/issues/1) を参照。要点:
 
-- WIF pool + provider (GitHub OIDC を trust)
-- `cloud-run-deployer` SA (deploy 用 — GitHub Actions から借りる)
-- `secrets-inventory-runtime` SA (Cloud Run attached — `roles/secretmanager.viewer` のみ)
-- shared secret (32 byte) を Google Secret Manager に格納し、Cloud Run が起動時に env var として参照
+- `cloud-run-deployer-staging` / `cloud-run-deployer` SA (deploy 用、JSON
+  key を発行して GitHub repo secret `GCP_DEPLOY_SA_KEY_STAGING` /
+  `GCP_DEPLOY_SA_KEY` に登録。rust-alc-api パターン)
+- `secrets-inventory-runtime-staging` / `secrets-inventory-runtime` SA
+  (Cloud Run attached、`roles/secretmanager.viewer` のみ。**JSON key は
+  発行しない** — Cloud Run の metadata server + ADC で取る)
+- shared secret (32 byte) を Google Secret Manager に格納し、Cloud Run が
+  起動時に env var `INVENTORY_API_KEY` として参照
 - 同値を Cloudflare Secrets Store にも投入 (`SECRETS_INVENTORY_GCP_PROXY_API_KEY`)
 
 ## 開発ルール
