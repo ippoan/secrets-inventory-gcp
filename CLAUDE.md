@@ -34,8 +34,10 @@ PR テンプレートは `.github/pull_request_template.md` で `Refs` を強制
 
 - 本 repo は親 repo (`ippoan/secrets-inventory`) Worker から呼ばれる
   **Cloud Run proxy**。値を返す API は実装しない、**メタデータのみ read**
-- **GCP の JSON key を発行しない**。Cloud Run の attached SA (`secrets-
-  inventory-runtime*`) + ADC (metadata server) で credential を取る
+- **GCP の JSON key を一切発行しない**。Cloud Run の attached SA (`secrets-
+  inventory-runtime*`) + ADC (metadata server) で runtime credential を取り、
+  GitHub Actions → GCP の deploy credential も **WIF (GitHub OIDC trust)**
+  で mint する。レポジトリシークレットに GCP key を置かない。
 - runtime SA に付与する IAM role は `roles/secretmanager.viewer` のみ。
   `accessor` (値の取得) は付けない
 - 親 repo Worker からの呼び出しは `X-Inventory-API-Key` header 経由の
@@ -61,30 +63,72 @@ ippoan の Cloud Run deploy 標準パターンに揃える: caller workflow で
 cloud-run-deploy.yml` reusable で **AR remote-repo (pull-through cache)
 経由で digest-pinned deploy**。
 
-> 「GCP key 0 個運用」は **runtime credential** (Cloud Run → Secret Manager)
-> の話で、Cloud Run の attached SA + ADC により維持される。deploy
-> credential (GitHub Actions → GCP) は別の境界で、ippoan 既存 repo
-> (`rust-alc-api` 等) と同じく **`staging-deploy@cloudsql-sv` SA の
-> JSON key を repo secret `GCP_SA_KEY`** に登録する方式に揃える。
+> **GCP key 0 個運用** は runtime / deploy 両側で達成:
+>
+> - **Runtime** (Cloud Run → Secret Manager): Cloud Run の attached SA +
+>   ADC (metadata server)
+> - **Deploy** (GitHub Actions → GCP): WIF (Workload Identity Federation +
+>   GitHub OIDC trust)。issue ippoan/secrets-inventory#3 で明記された方針。
 
 ### GCP 側 (one-time、`cloudsql-sv` project)
 
-既存 SA をできるだけ流用する。
+既存 リソースをできるだけ流用するが、Deployer SA は WIF 専用として新規
+作成する。
 
-- **Deployer**: `staging-deploy@cloudsql-sv.iam.gserviceaccount.com`
-  (既存、ippoan 横断 staging deployer)
-- **Runtime (Cloud Run attached)**: `secrets-inventory-viewer@cloudsql-sv.iam.gserviceaccount.com`
-  (既存、`roles/secretmanager.viewer` を持つことを確認。**JSON key は
-  発行しない** = ADC 経由で取る)
+- **WIF Pool + Provider** (新規):
+  ```bash
+  PROJECT=cloudsql-sv
+  POOL=github
+  PROVIDER=ippoan
+
+  gcloud iam workload-identity-pools create "$POOL" \
+    --project="$PROJECT" --location=global \
+    --display-name="GitHub Actions"
+
+  gcloud iam workload-identity-pools providers create-oidc "$PROVIDER" \
+    --project="$PROJECT" --location=global \
+    --workload-identity-pool="$POOL" \
+    --display-name="ippoan org OIDC" \
+    --issuer-uri="https://token.actions.githubusercontent.com" \
+    --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.ref=assertion.ref" \
+    --attribute-condition="assertion.repository_owner=='ippoan'"
+  ```
+  full path: `projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/github/providers/ippoan`
+
+- **Deployer SA** (`cloud-run-deployer-staging@cloudsql-sv.iam.gserviceaccount.com`):
+  - role: `roles/run.admin`, `roles/iam.serviceAccountUser` (Cloud Run に
+    runtime SA を attach するため), `roles/artifactregistry.reader`
+  - **JSON key は発行しない**
+  - WIF principal binding (`secrets-inventory-gcp` repo だけから impersonate 可):
+    ```bash
+    PROJECT_NUMBER=$(gcloud projects describe cloudsql-sv --format='value(projectNumber)')
+    PRINCIPAL="principalSet://iam.googleapis.com/projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/github/attribute.repository/ippoan/secrets-inventory-gcp"
+
+    gcloud iam service-accounts add-iam-policy-binding \
+      cloud-run-deployer-staging@cloudsql-sv.iam.gserviceaccount.com \
+      --project=cloudsql-sv \
+      --role="roles/iam.workloadIdentityUser" \
+      --member="$PRINCIPAL"
+    ```
+  - prod 用 (`cloud-run-deployer@cloudsql-sv.iam.gserviceaccount.com`) も
+    同様に作成 + WIF binding。`v*` tag push でだけ使うので連動するのは
+    production deploy を始めるタイミングでよい。
+
+- **Runtime SA (Cloud Run attached)**:
+  `secrets-inventory-viewer@cloudsql-sv.iam.gserviceaccount.com` (既存、
+  `roles/secretmanager.viewer` を持つことを確認。**JSON key は発行しない**
+  = ADC 経由で取る)
+
 - **AR remote-repo**: `asia-northeast1-docker.pkg.dev/cloudsql-sv/ghcr/`
   (既存、daiun-salary 等と共有。`ippoan/secrets-inventory-gcp` という
   path で同 remote-repo に乗る)
+
 - **Shared API key**: Google Secret Manager に
   `SECRETS_INVENTORY_GCP_PROXY_API_KEY_STAGING` (staging) /
   `SECRETS_INVENTORY_GCP_PROXY_API_KEY` (prod) を新規作成
   + `secrets-inventory-viewer` SA に `roles/secretmanager.secretAccessor`
   を **この secret 限定で** 付与
-- 同値を親 repo (`ippoan/secrets-inventory`) の Cloudflare Secrets Store
+  + 同値を親 repo (`ippoan/secrets-inventory`) の Cloudflare Secrets Store
   にも投入
 
 ### Cloud Run service の初回作成 (user 手動)
@@ -114,24 +158,31 @@ gcloud run deploy secrets-inventory-gcp-staging \
 
 **Secrets (encrypted, repo-level):**
 
-- `GCP_SA_KEY`: `staging-deploy@cloudsql-sv` SA の JSON key 全文
-  (`rust-alc-api` 等と同名、reusable の固定名)
+なし。WIF に切り替えたことにより、以前設定していた `GCP_SA_KEY` secret は
+**不要 → 削除**してよい。
 
 **Variables (plain text, repo-level):**
 
 - `GCP_REGION` = `asia-northeast1`
 - `GCP_PROJECT_ID_STAGING` = `cloudsql-sv`
-- (production を動かす段階で `GCP_PROJECT_ID` も追加)
+- `GCP_WIF_PROVIDER` =
+  `projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/github/providers/ippoan`
+- `GCP_WIF_SERVICE_ACCOUNT_STAGING` =
+  `cloud-run-deployer-staging@cloudsql-sv.iam.gserviceaccount.com`
+- (production を動かす段階で `GCP_PROJECT_ID` と
+  `GCP_WIF_SERVICE_ACCOUNT` も追加)
 
-`vars.GCP_PROJECT_ID_STAGING` が空のあいだは workflow の deploy job が
-`if:` で skip される (PR の必須 check `ci / vet` / `ci / test` /
-`ci / build` だけで通る)。setup 完了後に variable を入れた瞬間 deploy
-が動き始める。
+`vars.GCP_PROJECT_ID_STAGING` / `GCP_WIF_PROVIDER` /
+`GCP_WIF_SERVICE_ACCOUNT_STAGING` のいずれかが空だと workflow の
+`deploy-staging` job が `if:` で skip される (PR の必須 check
+`ci / vet` / `ci / test` / `ci / build` だけで通る)。setup 完了後に
+variable を入れた瞬間 deploy が動き始める。
 
 org-level に寄せるか repo-level に置くかは値の性質次第:
 
-- `GCP_REGION` / `GCP_SA_KEY` (org 横断 deployer) → org 推奨
+- `GCP_REGION` / `GCP_WIF_PROVIDER` (org 横断 pool/provider) → org 推奨
 - `GCP_PROJECT_ID_STAGING` も service 全部が `cloudsql-sv` なら org 可
+- `GCP_WIF_SERVICE_ACCOUNT_*` は service ごとに違うので repo-level
 
 ## ローカル開発
 
