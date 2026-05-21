@@ -48,9 +48,9 @@ func TestTsToRFC3339(t *testing.T) {
 	}
 }
 
-func TestHealthz(t *testing.T) {
+func TestHealth(t *testing.T) {
 	mux := newMuxWith(&fakeLister{}, "p", "k")
-	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {

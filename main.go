@@ -50,7 +50,7 @@ func main() {
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	log.Printf("secrets-inventory-gcp listening on :%s (project=%s)", port, projectID)
+log.Printf("secrets-inventory-gcp listening on :%s (project=%s)", port, projectID)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server: %v", err)
 	}
@@ -95,12 +95,15 @@ func (l *liveLister) ListSecrets(ctx context.Context, parent string) ([]*secretm
 
 func newMuxWith(l secretLister, projectID, apiKey string) *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", handleHealthz)
+	// `/healthz` は Cloud Run / GFE の reserved path 扱いで Google edge が直接
+	// 404 HTML を返してしまう (実 staging で再現)。`/health` に rename して
+	// app に届くようにする。
+	mux.HandleFunc("/health", handleHealth)
 	mux.Handle("/list-secrets", requireAPIKey(apiKey, handleListSecrets(l, projectID)))
 	return mux
 }
 
-func handleHealthz(w http.ResponseWriter, _ *http.Request) {
+func handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(`{"ok":true,"service":"secrets-inventory-gcp"}`))
 }

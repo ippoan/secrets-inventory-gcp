@@ -45,8 +45,10 @@ GCP Service Account の JSON key (~2KB) は Cloudflare Secrets Store の 1024 by
 
 | method | path | 認証 | 説明 |
 |---|---|---|---|
-| GET | `/healthz` | 不要 | health check (Cloud Run liveness) |
+| GET | `/health` | 不要 | health check (Cloud Run liveness) |
 | GET | `/list-secrets` | `X-Inventory-API-Key` 必須 | `projects/{GCP_PROJECT_ID}/secrets` を全件 list して JSON で返す |
+
+> Note: 以前は `/healthz` だったが、Cloud Run / GFE が `/healthz` を reserved path として扱うらしく Google edge で 404 を返してしまうため `/health` に rename した。
 
 `/list-secrets` のレスポンスは Worker 側の `SecretMetadata[]` 形にそのまま map できる shape (`name` は `projects/.../secrets/` prefix を剥がした短縮名)。
 
