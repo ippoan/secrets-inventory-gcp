@@ -66,6 +66,11 @@ jobs:
   # AR remote-repo `cloudsql-sv/ghcr` (daiun-salary 等と共有、既存) 経由で
   # digest pin した image を Cloud Run staging service に流す。
   #
+  # Auth: issue ippoan/secrets-inventory#3 に沿って WIF (Workload Identity
+  # Federation + GitHub OIDC trust)。reusable に workload_identity_provider
+  # + service_account を渡し、`GCP_SA_KEY` secret は使わない。
+  # **システム全体で GCP key 0 個**状態を維持 (runtime + deploy 両方)。
+  #
   # Cloud Run service `secrets-inventory-gcp-staging` は **既存前提** で、
   # reusable は services update を叩く。初回 service 作成は user が手動で
   # `gcloud run deploy --image ... --service-account
@@ -76,11 +81,17 @@ jobs:
   # `ci / *` の 3 つだけで通る。
   deploy-staging:
     if: |
-      vars.GCP_PROJECT_ID_STAGING != '' && (
+      vars.GCP_PROJECT_ID_STAGING != '' &&
+      vars.GCP_WIF_PROVIDER != '' &&
+      vars.GCP_WIF_SERVICE_ACCOUNT_STAGING != '' && (
         (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
         (github.event_name == 'pull_request' && github.event.pull_request.draft != true)
       )
     needs: [ci, build-image]
+    permissions:
+      contents: read
+      packages: read
+      id-token: write   # WIF OIDC token mint 用
     uses: ippoan/ci-workflows/.github/workflows/cloud-run-deploy.yml@main
     with:
       service: secrets-inventory-gcp-staging
@@ -89,16 +100,22 @@ jobs:
       ghcr_image: ghcr.io/ippoan/secrets-inventory-gcp
       image_tag: ${{ needs.build-image.outputs.image_tag }}
       ar_repo: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_STAGING }}/ghcr/ippoan/secrets-inventory-gcp
-    secrets:
-      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+      workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+      service_account: ${{ vars.GCP_WIF_SERVICE_ACCOUNT_STAGING }}
 
-  # production は v* タグでのみ deploy。staging-deploy SA を流用する想定。
-  # 別 SA に分けたい場合は repo secret `GCP_SA_KEY_PROD` 等を追加して
-  # 切り替える (将来必要になった時の判断)。
+  # production は v* タグでのみ deploy。staging と同じ WIF provider を使い、
+  # SA だけ prod 用 (`vars.GCP_WIF_SERVICE_ACCOUNT`) に切り替える。
   deploy-production:
     if: |
-      vars.GCP_PROJECT_ID != '' && startsWith(github.ref, 'refs/tags/v')
+      vars.GCP_PROJECT_ID != '' &&
+      vars.GCP_WIF_PROVIDER != '' &&
+      vars.GCP_WIF_SERVICE_ACCOUNT != '' &&
+      startsWith(github.ref, 'refs/tags/v')
     needs: [ci, build-image]
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
     uses: ippoan/ci-workflows/.github/workflows/cloud-run-deploy.yml@main
     with:
       service: secrets-inventory-gcp
@@ -107,5 +124,5 @@ jobs:
       ghcr_image: ghcr.io/ippoan/secrets-inventory-gcp
       image_tag: ${{ needs.build-image.outputs.image_tag }}
       ar_repo: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/ghcr/ippoan/secrets-inventory-gcp
-    secrets:
-      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+      workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+      service_account: ${{ vars.GCP_WIF_SERVICE_ACCOUNT }}
