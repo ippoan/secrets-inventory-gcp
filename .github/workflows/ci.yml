@@ -71,11 +71,16 @@ jobs:
   # + service_account を渡し、`GCP_SA_KEY` secret は使わない。
   # **システム全体で GCP key 0 個**状態を維持 (runtime + deploy 両方)。
   #
+  # env / secret も reusable 経由で declarative に渡す (drift 防止)。
+  # `main.go` が `mustEnv("GCP_PROJECT_ID")` / `mustEnv("INVENTORY_API_KEY")`
+  # を要求するので、それをここで渡して毎 deploy enforce する。
+  #
   # Cloud Run service `secrets-inventory-gcp-staging` は **既存前提** で、
   # reusable は services update を叩く。初回 service 作成は user が手動で
-  # `gcloud run deploy --image ... --service-account
-  # secrets-inventory-viewer@cloudsql-sv.iam.gserviceaccount.com` で 1 回
-  # 作っておくこと (CLAUDE.md 参照)。
+  # `gcloud run deploy --image=<placeholder> --service-account=secrets-
+  # inventory-viewer@cloudsql-sv.iam.gserviceaccount.com` で 1 回作っておく
+  # (CLAUDE.md 参照)。この時 env / secret は空で OK— 本 reusable が毎回
+  # `--set-env-vars` / `--update-secrets` で上書きする。
   #
   # GCP setup 未完了の間は vars が空で skip され、PR の必須 check は
   # `ci / *` の 3 つだけで通る。
@@ -102,9 +107,12 @@ jobs:
       ar_repo: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_STAGING }}/ghcr/ippoan/secrets-inventory-gcp
       workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
       service_account: ${{ vars.GCP_WIF_SERVICE_ACCOUNT_STAGING }}
+      set_env_vars: GCP_PROJECT_ID=${{ vars.GCP_PROJECT_ID_STAGING }}
+      update_secrets: INVENTORY_API_KEY=SECRETS_INVENTORY_GCP_PROXY_API_KEY_STAGING:latest
 
   # production は v* タグでのみ deploy。staging と同じ WIF provider を使い、
   # SA だけ prod 用 (`vars.GCP_WIF_SERVICE_ACCOUNT`) に切り替える。
+  # secret 名も prod 版: `SECRETS_INVENTORY_GCP_PROXY_API_KEY` (suffix なし)。
   deploy-production:
     if: |
       vars.GCP_PROJECT_ID != '' &&
@@ -126,3 +134,5 @@ jobs:
       ar_repo: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/ghcr/ippoan/secrets-inventory-gcp
       workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
       service_account: ${{ vars.GCP_WIF_SERVICE_ACCOUNT }}
+      set_env_vars: GCP_PROJECT_ID=${{ vars.GCP_PROJECT_ID }}
+      update_secrets: INVENTORY_API_KEY=SECRETS_INVENTORY_GCP_PROXY_API_KEY:latest
