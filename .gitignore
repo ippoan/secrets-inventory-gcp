@@ -1,0 +1,13 @@
+# build artifacts
+/server
+/out/
+*.test
+*.prof
+
+# editor / tooling
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
