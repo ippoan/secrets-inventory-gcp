@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
@@ -19,8 +20,15 @@ import (
 )
 
 type secretItem struct {
-	Name      string            `json:"name"`
-	CreatedAt string            `json:"created_at,omitempty"`
+	Name      string `json:"name"`
+	CreatedAt string `json:"created_at,omitempty"`
+	// UpdatedAt = 最新 version の create_time (= 最後の rotation 時刻)。
+	// Secret resource 自体に "updated" は無いため、Secret Manager の慣例
+	// として「親 secret の latest version の create_time」をその意味で
+	// expose する。Version が 0 件 (= 値未投入 / 全 destroy 済) の secret
+	// は空文字。親 repo (secrets-inventory) の UI はこれを使って配布先
+	// が GCP より古い (= rotation 反映漏れ) を ⚠ で警告する。
+	UpdatedAt string            `json:"updated_at,omitempty"`
 	Labels    map[string]string `json:"labels,omitempty"`
 }
 
@@ -68,6 +76,9 @@ func mustEnv(key string) string {
 // テストでは fake を差し込めるようにするための薄い境界。
 type secretLister interface {
 	ListSecrets(ctx context.Context, parent string) ([]*secretmanagerpb.Secret, error)
+	// LatestVersionCreateTime は親 secret (full name) の latest 1 version の
+	// create_time を返す。Version 0 件なら (nil, nil)。
+	LatestVersionCreateTime(ctx context.Context, secretName string) (*timestamppb.Timestamp, error)
 }
 
 type liveLister struct {
@@ -91,6 +102,24 @@ func (l *liveLister) ListSecrets(ctx context.Context, parent string) ([]*secretm
 		out = append(out, s)
 	}
 	return out, nil
+}
+
+// LatestVersionCreateTime は ListSecretVersions(PageSize=1) で最新 version を
+// 1 つだけ取って create_time を返す。SecretManager の version は create_time
+// 降順で返るので PageSize=1 = latest。Version が 0 件なら (nil, nil)。
+func (l *liveLister) LatestVersionCreateTime(ctx context.Context, secretName string) (*timestamppb.Timestamp, error) {
+	it := l.c.ListSecretVersions(ctx, &secretmanagerpb.ListSecretVersionsRequest{
+		Parent:   secretName,
+		PageSize: 1,
+	})
+	v, err := it.Next()
+	if errors.Is(err, iterator.Done) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return v.GetCreateTime(), nil
 }
 
 func newMuxWith(l secretLister, projectID, apiKey string) *http.ServeMux {
@@ -137,11 +166,33 @@ func handleListSecrets(l secretLister, projectID string) http.Handler {
 			return
 		}
 
+		// Latest version の create_time を並列で取る (N=secret 数の goroutine)。
+		// Secret Manager の version list API には list 内 batch が無いので
+		// N+1 呼び出しが避けられない。N 個並列にして wall time を抑え、
+		// 失敗した individual は updated_at 空で degrade (= UI は warning
+		// 出さず ✓ のまま、log には残す)。
+		updatedAt := make([]string, len(secrets))
+		var wg sync.WaitGroup
+		for i, s := range secrets {
+			wg.Add(1)
+			go func(i int, name string) {
+				defer wg.Done()
+				ts, vErr := l.LatestVersionCreateTime(ctx, name)
+				if vErr != nil {
+					log.Printf("latest version for %s: %v", name, vErr)
+					return
+				}
+				updatedAt[i] = tsToRFC3339(ts)
+			}(i, s.GetName())
+		}
+		wg.Wait()
+
 		items := make([]secretItem, 0, len(secrets))
-		for _, s := range secrets {
+		for i, s := range secrets {
 			items = append(items, secretItem{
 				Name:      shortName(s.GetName()),
 				CreatedAt: tsToRFC3339(s.GetCreateTime()),
+				UpdatedAt: updatedAt[i],
 				Labels:    s.GetLabels(),
 			})
 		}
