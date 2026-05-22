@@ -9,10 +9,15 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	iamadmin "cloud.google.com/go/iam/admin/apiv1"
+	"cloud.google.com/go/iam/admin/apiv1/adminpb"
+	iampb "cloud.google.com/go/iam/apiv1/iampb"
+	resourcemanager "cloud.google.com/go/resourcemanager/apiv3"
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
 	"cloud.google.com/go/secretmanager/apiv1/secretmanagerpb"
 	"google.golang.org/api/iterator"
@@ -36,6 +41,35 @@ type listResponse struct {
 	Secrets []secretItem `json:"secrets"`
 }
 
+// saKeyItem は SA key の **メタデータのみ**。`PrivateKeyData` (= 私有鍵 material)
+// は絶対に含めない。defense in depth として handler test で空であることを固定する。
+type saKeyItem struct {
+	// Id は key の short name (= full resource name の末尾 segment)。
+	Id string `json:"id"`
+	// KeyType は "USER_MANAGED" / "SYSTEM_MANAGED"。
+	KeyType string `json:"key_type"`
+	// ValidAfter は `validAfterTime` = key 作成日時 (RFC3339)。
+	ValidAfter string `json:"valid_after,omitempty"`
+	// ValidBefore は `validBeforeTime` = key 失効日時 (RFC3339)。
+	ValidBefore string `json:"valid_before,omitempty"`
+}
+
+// serviceAccountItem は IAM SA 1 件の inventory 用 view。
+// roles は project IAM policy を逆引きした list (sorted unique)。
+type serviceAccountItem struct {
+	Email       string      `json:"email"`
+	DisplayName string      `json:"display_name,omitempty"`
+	Description string      `json:"description,omitempty"`
+	UniqueId    string      `json:"unique_id"`
+	Disabled    bool        `json:"disabled"`
+	Roles       []string    `json:"roles"`
+	Keys        []saKeyItem `json:"keys"`
+}
+
+type listServiceAccountsResponse struct {
+	ServiceAccounts []serviceAccountItem `json:"service_accounts"`
+}
+
 func main() {
 	projectID := mustEnv("GCP_PROJECT_ID")
 	apiKey := mustEnv("INVENTORY_API_KEY")
@@ -51,7 +85,24 @@ func main() {
 	}
 	defer client.Close()
 
-	mux := newMuxWith(&liveLister{c: client}, projectID, apiKey)
+	iamClient, err := iamadmin.NewIamClient(ctx)
+	if err != nil {
+		log.Fatalf("iam admin client: %v", err)
+	}
+	defer iamClient.Close()
+
+	crmClient, err := resourcemanager.NewProjectsClient(ctx)
+	if err != nil {
+		log.Fatalf("resource manager projects client: %v", err)
+	}
+	defer crmClient.Close()
+
+	mux := newMuxWith(
+		&liveLister{c: client},
+		&liveIAMLister{iam: iamClient, crm: crmClient},
+		projectID,
+		apiKey,
+	)
 
 	srv := &http.Server{
 		Addr:              ":" + port,
@@ -122,13 +173,71 @@ func (l *liveLister) LatestVersionCreateTime(ctx context.Context, secretName str
 	return v.GetCreateTime(), nil
 }
 
-func newMuxWith(l secretLister, projectID, apiKey string) *http.ServeMux {
+// iamLister は IAM Admin + Resource Manager の必要部分だけ切り出した interface。
+// テストでは fake を差し込む。proxy 自身が hold する権限は `roles/iam.securityReviewer`
+// のみで、SA / key 作成・削除は実行できない (= read-only client)。
+type iamLister interface {
+	ListServiceAccounts(ctx context.Context, project string) ([]*adminpb.ServiceAccount, error)
+	ListServiceAccountKeys(ctx context.Context, saName string) ([]*adminpb.ServiceAccountKey, error)
+	GetProjectIamPolicy(ctx context.Context, project string) (*iampb.Policy, error)
+}
+
+type liveIAMLister struct {
+	iam *iamadmin.IamClient
+	crm *resourcemanager.ProjectsClient
+}
+
+func (l *liveIAMLister) ListServiceAccounts(ctx context.Context, project string) ([]*adminpb.ServiceAccount, error) {
+	var out []*adminpb.ServiceAccount
+	it := l.iam.ListServiceAccounts(ctx, &adminpb.ListServiceAccountsRequest{
+		Name:     fmt.Sprintf("projects/%s", project),
+		PageSize: 100,
+	})
+	for {
+		s, err := it.Next()
+		if errors.Is(err, iterator.Done) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+func (l *liveIAMLister) ListServiceAccountKeys(ctx context.Context, saName string) ([]*adminpb.ServiceAccountKey, error) {
+	// keys.list は pagination 無しで一発で全 key 返す API。USER_MANAGED と
+	// SYSTEM_MANAGED 両方含む。`KeyTypes` を指定しないと両方返る (= default)。
+	resp, err := l.iam.ListServiceAccountKeys(ctx, &adminpb.ListServiceAccountKeysRequest{
+		Name: saName,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.GetKeys(), nil
+}
+
+func (l *liveIAMLister) GetProjectIamPolicy(ctx context.Context, project string) (*iampb.Policy, error) {
+	// Resource Manager v3 の Project に対する getIamPolicy。
+	return l.crm.GetIamPolicy(ctx, &iampb.GetIamPolicyRequest{
+		Resource: fmt.Sprintf("projects/%s", project),
+		Options:  &iampb.GetPolicyOptions{RequestedPolicyVersion: 3},
+	})
+}
+
+func newMuxWith(
+	l secretLister,
+	iamL iamLister,
+	projectID, apiKey string,
+) *http.ServeMux {
 	mux := http.NewServeMux()
 	// `/healthz` は Cloud Run / GFE の reserved path 扱いで Google edge が直接
 	// 404 HTML を返してしまう (実 staging で再現)。`/health` に rename して
 	// app に届くようにする。
 	mux.HandleFunc("/health", handleHealth)
 	mux.Handle("/list-secrets", requireAPIKey(apiKey, handleListSecrets(l, projectID)))
+	mux.Handle("/list-service-accounts", requireAPIKey(apiKey, handleListServiceAccounts(iamL, projectID)))
 	return mux
 }
 
@@ -199,6 +308,150 @@ func handleListSecrets(l secretLister, projectID string) http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(listResponse{Secrets: items})
 	})
+}
+
+func handleListServiceAccounts(l iamLister, projectID string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+		defer cancel()
+
+		// SA 一覧 + project IAM policy を並列 fetch
+		var sas []*adminpb.ServiceAccount
+		var policy *iampb.Policy
+		var saErr, policyErr error
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			sas, saErr = l.ListServiceAccounts(ctx, projectID)
+		}()
+		go func() {
+			defer wg.Done()
+			policy, policyErr = l.GetProjectIamPolicy(ctx, projectID)
+		}()
+		wg.Wait()
+
+		if saErr != nil {
+			log.Printf("list service accounts: %v", saErr)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+
+		// policy 取得失敗は warning 扱い: SA 一覧自体は返し、roles 列だけ空。
+		// secrets の updated_at 失敗時と同じ degrade pattern。
+		rolesBySA := map[string][]string{}
+		if policyErr != nil {
+			log.Printf("get iam policy: %v", policyErr)
+		} else if policy != nil {
+			rolesBySA = invertPolicyForServiceAccounts(policy)
+		}
+
+		// 各 SA の keys を並列 fetch (N+1、log only degrade)。
+		// 失敗した SA は keys 空で返す (= UI では "keys: ?" 表示にできる)。
+		keysBySA := make([][]saKeyItem, len(sas))
+		var wg2 sync.WaitGroup
+		for i, sa := range sas {
+			wg2.Add(1)
+			go func(i int, saName, saEmail string) {
+				defer wg2.Done()
+				keys, kErr := l.ListServiceAccountKeys(ctx, saName)
+				if kErr != nil {
+					log.Printf("list keys for %s: %v", saEmail, kErr)
+					return
+				}
+				items := make([]saKeyItem, 0, len(keys))
+				for _, k := range keys {
+					items = append(items, toKeyItem(k))
+				}
+				keysBySA[i] = items
+			}(i, sa.GetName(), sa.GetEmail())
+		}
+		wg2.Wait()
+
+		items := make([]serviceAccountItem, 0, len(sas))
+		for i, sa := range sas {
+			items = append(items, serviceAccountItem{
+				Email:       sa.GetEmail(),
+				DisplayName: sa.GetDisplayName(),
+				Description: sa.GetDescription(),
+				UniqueId:    sa.GetUniqueId(),
+				Disabled:    sa.GetDisabled(),
+				Roles:       emptyIfNil(rolesBySA[sa.GetEmail()]),
+				Keys:        emptyKeysIfNil(keysBySA[i]),
+			})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(listServiceAccountsResponse{ServiceAccounts: items})
+	})
+}
+
+// invertPolicyForServiceAccounts は IAM policy の bindings を SA email → roles
+// の逆引き map にする。`serviceAccount:` prefix の member だけ拾う (= user / group
+// / domain は対象外、SA inventory が目的なので)。`deleted:serviceAccount:...`
+// (= tombstone) も sufficient prefix 一致なら含めるが、現状の prefix は
+// `serviceAccount:` のみ。重複した role は dedup する。
+func invertPolicyForServiceAccounts(policy *iampb.Policy) map[string][]string {
+	out := map[string][]string{}
+	const prefix = "serviceAccount:"
+	for _, b := range policy.GetBindings() {
+		role := b.GetRole()
+		for _, m := range b.GetMembers() {
+			if !strings.HasPrefix(m, prefix) {
+				continue
+			}
+			email := m[len(prefix):]
+			out[email] = append(out[email], role)
+		}
+	}
+	for email, roles := range out {
+		out[email] = sortAndDedupRoles(roles)
+	}
+	return out
+}
+
+func sortAndDedupRoles(roles []string) []string {
+	if len(roles) == 0 {
+		return roles
+	}
+	sort.Strings(roles)
+	dedup := roles[:0]
+	prev := ""
+	for i, r := range roles {
+		if i == 0 || r != prev {
+			dedup = append(dedup, r)
+		}
+		prev = r
+	}
+	return dedup
+}
+
+// toKeyItem は SA key proto を **メタデータのみ** の view に縮約する。
+// `PrivateKeyData` (= 私有鍵 material) は **絶対に含めない**。
+func toKeyItem(k *adminpb.ServiceAccountKey) saKeyItem {
+	return saKeyItem{
+		Id:          shortName(k.GetName()),
+		KeyType:     k.GetKeyType().String(),
+		ValidAfter:  tsToRFC3339(k.GetValidAfterTime()),
+		ValidBefore: tsToRFC3339(k.GetValidBeforeTime()),
+	}
+}
+
+func emptyIfNil(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
+}
+
+func emptyKeysIfNil(s []saKeyItem) []saKeyItem {
+	if s == nil {
+		return []saKeyItem{}
+	}
+	return s
 }
 
 func shortName(fullName string) string {
