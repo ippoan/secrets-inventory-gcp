@@ -153,3 +153,32 @@ jobs:
       runtime_service_account: secrets-inventory-viewer@cloudsql-sv.iam.gserviceaccount.com
       set_env_vars: GCP_PROJECT_ID=${{ vars.GCP_PROJECT_ID_STAGING }}
       update_secrets: INVENTORY_API_KEY=SECRETS_INVENTORY_GCP_PROXY_API_KEY_STAGING:latest
+
+  # 全 CI job (= ci / build-image / deploy-staging) が success した時だけ
+  # ci-workflows の auto-merge.yml reusable を呼んで PR auto-merge を enable。
+  # 内部実装は `gh pr merge --auto --squash` (= GitHub-native auto-merge を
+  # queue する)。frontend-ci.yml が同 reusable を内蔵で呼んでいる pattern と
+  # 揃える (go-ci.yml には auto-merge が組み込まれていないため caller で呼ぶ)。
+  #
+  # disable-auto-merge job との対 (= dual-step pattern):
+  #   - PR open 時: disable-auto-merge が走り、人が enable してた auto-merge
+  #     を即 disable (= 中途で誤 enable された場合の defense in depth)
+  #   - 全 CI success 後: 本 job が走り auto-merge を再 enable → merge queue
+  #
+  # `needs:` が success 評価された時点で本 job が動くため、branch protection
+  # の required check 設定が空でも、ここに来た時点で「全 CI green が確定」
+  # している = PR #20 のような CI fail 中の誤 merge は起きない。
+  auto-merge:
+    name: Auto Merge
+    needs: [ci, build-image, deploy-staging]
+    if: >-
+      always() &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.draft == false &&
+      needs.ci.result == 'success' &&
+      (needs.build-image.result == 'success' || needs.build-image.result == 'skipped') &&
+      (needs.deploy-staging.result == 'success' || needs.deploy-staging.result == 'skipped')
+    uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
+    permissions:
+      contents: write
+      pull-requests: write
