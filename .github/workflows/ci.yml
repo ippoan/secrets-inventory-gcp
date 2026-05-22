@@ -1,9 +1,11 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
+  # `push: main` / `tags: v*` は意図的に declare しない:
+  #   - PR merge 後の main push で重複 CI run が走るのを排除
+  #   - production は使わない (staging = prod 運用) ため tag deploy 不要
+  # staging deploy は `pull_request` event の `deploy-staging` job が
+  # PR open / synchronize 時に動かす (= merge 前に PR で staging 反映)。
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
@@ -13,6 +15,30 @@ permissions:
   packages: write   # build-image で GHCR push に必要
 
 jobs:
+  # PR auto-merge を **CI 開始時に強制 disable** する。本 repo の branch
+  # protection が required check に `ci / secret-verify` を含めていなかった
+  # 期間 (Refs #21)、`enable_pr_auto_merge` API call → 数秒後 CI fail 状態
+  # で merge 完了、という事故が発生 (= PR #20)。本 job は人間 / bot が
+  # GH UI / API で auto-merge を enable しても即座に disable し、merge は
+  # 必ず明示的な「UI の merge ボタン押下」or `gh pr merge` でのみ可能、
+  # = **CI 結果を目視確認してから merge** する運用に強制移行する。
+  #
+  # `|| true` は「既に disable」「PR closed」等の no-op エラーを握り潰す
+  # 用途。本 job 自体が fail することはほぼ無い。
+  disable-auto-merge:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Force-disable PR auto-merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh pr merge --disable-auto "$PR_NUMBER" -R "$REPO" || true
+
   # `ippoan/ci-workflows/.github/workflows/go-ci.yml` の 3 job (vet / test /
   # build) を `ci` job id 配下に呼び出す。status check 名は caller job id
   # + ' / ' + reusable job name で:
@@ -51,9 +77,7 @@ jobs:
   # image tag は github.sha (short) で固定 — deploy 側で digest を解決する
   # ので tag のスタブ性は問題にならない。
   build-image:
-    if: |
-      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) ||
-      (github.event_name == 'pull_request' && github.event.pull_request.draft != true)
+    if: github.event.pull_request.draft != true
     needs: [ci]
     runs-on: ubuntu-latest
     permissions:
@@ -109,10 +133,8 @@ jobs:
     if: |
       vars.GCP_PROJECT_ID_STAGING != '' &&
       vars.GCP_WIF_PROVIDER != '' &&
-      vars.GCP_WIF_SERVICE_ACCOUNT_STAGING != '' && (
-        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-        (github.event_name == 'pull_request' && github.event.pull_request.draft != true)
-      )
+      vars.GCP_WIF_SERVICE_ACCOUNT_STAGING != '' &&
+      github.event.pull_request.draft != true
     needs: [ci, build-image]
     permissions:
       contents: read
@@ -132,32 +154,31 @@ jobs:
       set_env_vars: GCP_PROJECT_ID=${{ vars.GCP_PROJECT_ID_STAGING }}
       update_secrets: INVENTORY_API_KEY=SECRETS_INVENTORY_GCP_PROXY_API_KEY_STAGING:latest
 
-  # production は v* タグでのみ deploy。staging と同じ WIF provider を使い、
-  # SA だけ prod 用 (`vars.GCP_WIF_SERVICE_ACCOUNT`) に切り替える。
-  # secret 名も prod 版: `SECRETS_INVENTORY_GCP_PROXY_API_KEY` (suffix なし)。
-  # runtime SA は staging と共通の `secrets-inventory-viewer@cloudsql-sv`
-  # (CLAUDE.md で 「staging と prod で同じ viewer SA」 方針)。
-  deploy-production:
-    if: |
-      vars.GCP_PROJECT_ID != '' &&
-      vars.GCP_WIF_PROVIDER != '' &&
-      vars.GCP_WIF_SERVICE_ACCOUNT != '' &&
-      startsWith(github.ref, 'refs/tags/v')
-    needs: [ci, build-image]
+  # 全 CI job (= ci / build-image / deploy-staging) が success した時だけ
+  # ci-workflows の auto-merge.yml reusable を呼んで PR auto-merge を enable。
+  # 内部実装は `gh pr merge --auto --squash` (= GitHub-native auto-merge を
+  # queue する)。frontend-ci.yml が同 reusable を内蔵で呼んでいる pattern と
+  # 揃える (go-ci.yml には auto-merge が組み込まれていないため caller で呼ぶ)。
+  #
+  # disable-auto-merge job との対 (= dual-step pattern):
+  #   - PR open 時: disable-auto-merge が走り、人が enable してた auto-merge
+  #     を即 disable (= 中途で誤 enable された場合の defense in depth)
+  #   - 全 CI success 後: 本 job が走り auto-merge を再 enable → merge queue
+  #
+  # `needs:` が success 評価された時点で本 job が動くため、branch protection
+  # の required check 設定が空でも、ここに来た時点で「全 CI green が確定」
+  # している = PR #20 のような CI fail 中の誤 merge は起きない。
+  auto-merge:
+    name: Auto Merge
+    needs: [ci, build-image, deploy-staging]
+    if: >-
+      always() &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.draft == false &&
+      needs.ci.result == 'success' &&
+      (needs.build-image.result == 'success' || needs.build-image.result == 'skipped') &&
+      (needs.deploy-staging.result == 'success' || needs.deploy-staging.result == 'skipped')
+    uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
     permissions:
-      contents: read
-      packages: read
-      id-token: write
-    uses: ippoan/ci-workflows/.github/workflows/cloud-run-deploy.yml@main
-    with:
-      service: secrets-inventory-gcp
-      region: ${{ vars.GCP_REGION }}
-      project: ${{ vars.GCP_PROJECT_ID }}
-      ghcr_image: ghcr.io/ippoan/secrets-inventory-gcp
-      image_tag: ${{ needs.build-image.outputs.image_tag }}
-      ar_repo: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/ghcr/ippoan/secrets-inventory-gcp
-      workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
-      service_account: ${{ vars.GCP_WIF_SERVICE_ACCOUNT }}
-      runtime_service_account: secrets-inventory-viewer@cloudsql-sv.iam.gserviceaccount.com
-      set_env_vars: GCP_PROJECT_ID=${{ vars.GCP_PROJECT_ID }}
-      update_secrets: INVENTORY_API_KEY=SECRETS_INVENTORY_GCP_PROXY_API_KEY:latest
+      contents: write
+      pull-requests: write
