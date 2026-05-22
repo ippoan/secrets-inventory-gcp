@@ -21,6 +21,7 @@ import (
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
 	"cloud.google.com/go/secretmanager/apiv1/secretmanagerpb"
 	"google.golang.org/api/iterator"
+	policyanalyzer "google.golang.org/api/policyanalyzer/v1"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -64,6 +65,18 @@ type serviceAccountItem struct {
 	Disabled    bool        `json:"disabled"`
 	Roles       []string    `json:"roles"`
 	Keys        []saKeyItem `json:"keys"`
+	// LastAuthenticatedAt = Policy Analyzer
+	// (`serviceAccountLastAuthentication` activity type) が返す
+	// `activity.lastAuthenticatedTime` を RFC3339 でそのまま expose。
+	//
+	// データ無し (= 観測期間中 1 度も authenticate していない、または Policy
+	// Analyzer 側 API が落ちている / 権限不足) のときは空文字。Worker UI は
+	// 空文字 → "—" 表示 + "stale-auth" 系の audit 判定をかける。
+	//
+	// timestamp の精度は GCP 側で日次粒度に丸められる (08:00 UTC 固定の
+	// `T07:00:00Z` 表記が docs にあるが、`07` 固定は古いリージョンのみで実際の
+	// time は変わりうる) ので、worker 側では "N 日前" 表示に丸めて使う想定。
+	LastAuthenticatedAt string `json:"last_authenticated_at,omitempty"`
 }
 
 type listServiceAccountsResponse struct {
@@ -97,9 +110,17 @@ func main() {
 	}
 	defer crmClient.Close()
 
+	// policyanalyzer は REST-based なので Close 不要。net/http の Client が
+	// 内部で garbage collect されれば足りる。
+	paService, err := policyanalyzer.NewService(ctx)
+	if err != nil {
+		log.Fatalf("policy analyzer service: %v", err)
+	}
+
 	mux := newMuxWith(
 		&liveLister{c: client},
 		&liveIAMLister{iam: iamClient, crm: crmClient},
+		&livePolicyAnalyzer{svc: paService},
 		projectID,
 		apiKey,
 	)
@@ -226,9 +247,87 @@ func (l *liveIAMLister) GetProjectIamPolicy(ctx context.Context, project string)
 	})
 }
 
+// saActivityLister は Policy Analyzer の
+// `serviceAccountLastAuthentication` activity を **SA email -> RFC3339
+// 認証時刻** の map にまとめて返す。テスト用には fake を差し込む。
+//
+// 取得失敗 (権限不足 / API 未有効 / 障害) は **err non-nil**。caller 側で
+// log + 空 map degrade を選ぶか fail-fast にするかを決める。本 proxy は
+// "認証時刻は補助情報" 扱いで前者を採る (SA 一覧自体は出す)。
+type saActivityLister interface {
+	LastAuthenticatedTimes(ctx context.Context, project string) (map[string]string, error)
+}
+
+type livePolicyAnalyzer struct {
+	svc *policyanalyzer.Service
+}
+
+// LastAuthenticatedTimes は project の全 SA の最終認証時刻を 1 endpoint
+// で取りに行く (per-SA audit log read のような N+1 ではない)。Activities
+// は内部 paging される ので Pages を用いて全 page を回収。
+//
+// response の Activity payload は `RawMessage` で運ばれてくるので、本 proxy
+// が知っている `lastAuthenticatedTime` だけ抜き取る (= 値の漏出防止: 認証
+// 内容まで Worker に渡さない)。
+func (l *livePolicyAnalyzer) LastAuthenticatedTimes(ctx context.Context, project string) (map[string]string, error) {
+	parent := fmt.Sprintf("projects/%s/locations/global/activityTypes/serviceAccountLastAuthentication", project)
+	out := map[string]string{}
+	call := l.svc.Projects.Locations.ActivityTypes.Activities.Query(parent).PageSize(1000)
+	err := call.Pages(ctx, func(resp *policyanalyzer.GoogleCloudPolicyanalyzerV1QueryActivityResponse) error {
+		for _, a := range resp.Activities {
+			email := saEmailFromFullResourceName(a.FullResourceName)
+			if email == "" {
+				continue
+			}
+			ts, ok := parseLastAuthenticatedTime(a.Activity)
+			if !ok || ts == "" {
+				continue
+			}
+			out[email] = ts
+		}
+		return nil
+	})
+	return out, err
+}
+
+// saEmailFromFullResourceName は Policy Analyzer の `fullResourceName`
+// (`//iam.googleapis.com/projects/.../serviceAccounts/<email>`) から末尾の
+// email を取り出す。`/` が含まれない (= 想定外 shape) なら空文字。
+func saEmailFromFullResourceName(s string) string {
+	idx := strings.LastIndex(s, "/")
+	if idx < 0 {
+		return ""
+	}
+	return s[idx+1:]
+}
+
+// parseLastAuthenticatedTime は Activity payload (googleapi.RawMessage =
+// []byte) から `lastAuthenticatedTime` を抜き取る。docs shape は:
+//
+//	{
+//	  "lastAuthenticatedTime": "2026-04-28T07:00:00Z",
+//	  "serviceAccount": { ... }
+//	}
+//
+// 認証履歴が無い SA はそもそも response に含まれないが、
+// `lastAuthenticatedTime` が空のケースを想定して 2 値返す。
+func parseLastAuthenticatedTime(raw []byte) (string, bool) {
+	if len(raw) == 0 {
+		return "", false
+	}
+	var payload struct {
+		LastAuthenticatedTime string `json:"lastAuthenticatedTime"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return "", false
+	}
+	return payload.LastAuthenticatedTime, true
+}
+
 func newMuxWith(
 	l secretLister,
 	iamL iamLister,
+	actL saActivityLister,
 	projectID, apiKey string,
 ) *http.ServeMux {
 	mux := http.NewServeMux()
@@ -237,7 +336,7 @@ func newMuxWith(
 	// app に届くようにする。
 	mux.HandleFunc("/health", handleHealth)
 	mux.Handle("/list-secrets", requireAPIKey(apiKey, handleListSecrets(l, projectID)))
-	mux.Handle("/list-service-accounts", requireAPIKey(apiKey, handleListServiceAccounts(iamL, projectID)))
+	mux.Handle("/list-service-accounts", requireAPIKey(apiKey, handleListServiceAccounts(iamL, actL, projectID)))
 	return mux
 }
 
@@ -310,7 +409,7 @@ func handleListSecrets(l secretLister, projectID string) http.Handler {
 	})
 }
 
-func handleListServiceAccounts(l iamLister, projectID string) http.Handler {
+func handleListServiceAccounts(l iamLister, actL saActivityLister, projectID string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -319,12 +418,13 @@ func handleListServiceAccounts(l iamLister, projectID string) http.Handler {
 		ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
 		defer cancel()
 
-		// SA 一覧 + project IAM policy を並列 fetch
+		// SA 一覧 + project IAM policy + 最終認証時刻 (Policy Analyzer) を並列 fetch
 		var sas []*adminpb.ServiceAccount
 		var policy *iampb.Policy
-		var saErr, policyErr error
+		var lastAuth map[string]string
+		var saErr, policyErr, actErr error
 		var wg sync.WaitGroup
-		wg.Add(2)
+		wg.Add(3)
 		go func() {
 			defer wg.Done()
 			sas, saErr = l.ListServiceAccounts(ctx, projectID)
@@ -332,6 +432,10 @@ func handleListServiceAccounts(l iamLister, projectID string) http.Handler {
 		go func() {
 			defer wg.Done()
 			policy, policyErr = l.GetProjectIamPolicy(ctx, projectID)
+		}()
+		go func() {
+			defer wg.Done()
+			lastAuth, actErr = actL.LastAuthenticatedTimes(ctx, projectID)
 		}()
 		wg.Wait()
 
@@ -348,6 +452,13 @@ func handleListServiceAccounts(l iamLister, projectID string) http.Handler {
 			log.Printf("get iam policy: %v", policyErr)
 		} else if policy != nil {
 			rolesBySA = invertPolicyForServiceAccounts(policy)
+		}
+
+		// Policy Analyzer 失敗も同じく warning 扱い: last_authenticated_at が
+		// 全 SA 空文字になるだけで一覧自体は返す。Worker UI は空文字 → "—"。
+		if actErr != nil {
+			log.Printf("policy analyzer last auth: %v", actErr)
+			lastAuth = nil
 		}
 
 		// 各 SA の keys を並列 fetch (N+1、log only degrade)。
@@ -375,13 +486,14 @@ func handleListServiceAccounts(l iamLister, projectID string) http.Handler {
 		items := make([]serviceAccountItem, 0, len(sas))
 		for i, sa := range sas {
 			items = append(items, serviceAccountItem{
-				Email:       sa.GetEmail(),
-				DisplayName: sa.GetDisplayName(),
-				Description: sa.GetDescription(),
-				UniqueId:    sa.GetUniqueId(),
-				Disabled:    sa.GetDisabled(),
-				Roles:       emptyIfNil(rolesBySA[sa.GetEmail()]),
-				Keys:        emptyKeysIfNil(keysBySA[i]),
+				Email:               sa.GetEmail(),
+				DisplayName:         sa.GetDisplayName(),
+				Description:         sa.GetDescription(),
+				UniqueId:            sa.GetUniqueId(),
+				Disabled:            sa.GetDisabled(),
+				Roles:               emptyIfNil(rolesBySA[sa.GetEmail()]),
+				Keys:                emptyKeysIfNil(keysBySA[i]),
+				LastAuthenticatedAt: lastAuth[sa.GetEmail()],
 			})
 		}
 		w.Header().Set("Content-Type", "application/json")
