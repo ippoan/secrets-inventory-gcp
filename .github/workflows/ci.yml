@@ -24,6 +24,16 @@ jobs:
   ci:
     if: github.event.pull_request.draft != true
     uses: ippoan/ci-workflows/.github/workflows/go-ci.yml@main
+    with:
+      # GCP Secret Manager verify を **ci の直列後段** に組み込む。go-ci.yml
+      # 側 (ci-workflows#38) で `secret-verify` job が `needs: [vet, test,
+      # build]` で動き、status check は `ci / secret-verify` に出る。
+      # vars 未設定の間は go-ci の `if:` で skip される (= 既存挙動互換)。
+      # 検証 SA は staging deploy と同じ WIF SA を流用し、`secretmanager.viewer`
+      # role を 1 個追加するだけで動く。
+      gcp_secret_verify_project: cloudsql-sv
+      gcp_secret_verify_provider: ${{ vars.GCP_WIF_PROVIDER }}
+      gcp_secret_verify_sa: ${{ vars.GCP_WIF_SERVICE_ACCOUNT_STAGING }}
 
   # GHCR への image push。non-draft PR と main push、v* tag push で走る。
   # ippoan の Cloud Run deploy 標準パターン (ci-workflows/cloud-run-
