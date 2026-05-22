@@ -195,12 +195,22 @@ func (l *liveLister) LatestVersionCreateTime(ctx context.Context, secretName str
 }
 
 // iamLister は IAM Admin + Resource Manager の必要部分だけ切り出した interface。
-// テストでは fake を差し込む。proxy 自身が hold する権限は `roles/iam.securityReviewer`
-// のみで、SA / key 作成・削除は実行できない (= read-only client)。
+// テストでは fake を差し込む。基本は read-only (list + getIamPolicy) だが、
+// **disable / enable のみ例外的に write 可** とする (reversible 操作、`delete`
+// は実装しない)。これは secrets-inventory 全体の "テスト・即時復元用途で
+// disable/enable のみ許可" の方針に合わせたもの (CLAUDE.md 参照)。
+//
+// 必要 IAM:
+//   - `roles/iam.securityReviewer` (read)
+//   - `iam.serviceAccounts.disable` + `.enable` (= 専用 custom role)
+//   - `roles/iam.serviceAccountAdmin` 等の delete 含むロールは grant しない
 type iamLister interface {
 	ListServiceAccounts(ctx context.Context, project string) ([]*adminpb.ServiceAccount, error)
 	ListServiceAccountKeys(ctx context.Context, saName string) ([]*adminpb.ServiceAccountKey, error)
 	GetProjectIamPolicy(ctx context.Context, project string) (*iampb.Policy, error)
+	// SetServiceAccountDisabled は `disabled=true` で disable、`false` で
+	// enable する。冪等 (= 既に同じ状態なら 200 で成功)。delete は提供しない。
+	SetServiceAccountDisabled(ctx context.Context, saName string, disabled bool) error
 }
 
 type liveIAMLister struct {
@@ -245,6 +255,18 @@ func (l *liveIAMLister) GetProjectIamPolicy(ctx context.Context, project string)
 		Resource: fmt.Sprintf("projects/%s", project),
 		Options:  &iampb.GetPolicyOptions{RequestedPolicyVersion: 3},
 	})
+}
+
+// SetServiceAccountDisabled は IAM Admin の DisableServiceAccount /
+// EnableServiceAccount を呼ぶ。Cloud Run service の attached SA に
+// `iam.serviceAccounts.disable` + `.enable` が必要 (custom role 推奨)。
+// **冪等**: 既に同じ disabled 状態の SA を再度叩いても GCP 側は no-op で
+// success を返す。
+func (l *liveIAMLister) SetServiceAccountDisabled(ctx context.Context, saName string, disabled bool) error {
+	if disabled {
+		return l.iam.DisableServiceAccount(ctx, &adminpb.DisableServiceAccountRequest{Name: saName})
+	}
+	return l.iam.EnableServiceAccount(ctx, &adminpb.EnableServiceAccountRequest{Name: saName})
 }
 
 // saActivityLister は Policy Analyzer の
@@ -337,6 +359,8 @@ func newMuxWith(
 	mux.HandleFunc("/health", handleHealth)
 	mux.Handle("/list-secrets", requireAPIKey(apiKey, handleListSecrets(l, projectID)))
 	mux.Handle("/list-service-accounts", requireAPIKey(apiKey, handleListServiceAccounts(iamL, actL, projectID)))
+	mux.Handle("/sa-disable", requireAPIKey(apiKey, handleSetSADisabled(iamL, true)))
+	mux.Handle("/sa-enable", requireAPIKey(apiKey, handleSetSADisabled(iamL, false)))
 	return mux
 }
 
@@ -355,6 +379,65 @@ func requireAPIKey(expected string, next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// handleSetSADisabled は POST /sa-disable / POST /sa-enable のハンドラ。
+// query string `email` で対象 SA を指定、`X-Actor-Email` header に実操作者
+// (CF Access JWT claim の email) を渡してもらう。actor は GCP 側 audit log
+// (`principalEmail=secrets-inventory-viewer@...`) には載らないので、本 proxy
+// が application log で記録する。両方を Cloud Logging で突合すれば操作の
+// 完全な audit trail が取れる。
+//
+// 失敗 5xx は upstream IAM Admin の error をそのまま 502 で返し、proxy が
+// 値の中身を解釈・露出しない。値漏れ防止のため request body は読まず、
+// response body も `{ "ok": true }` のみ。
+func handleSetSADisabled(l iamLister, disabled bool) http.Handler {
+	action := "ENABLE"
+	if disabled {
+		action = "DISABLE"
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		email := r.URL.Query().Get("email")
+		if email == "" {
+			http.Error(w, "missing email", http.StatusBadRequest)
+			return
+		}
+
+		actor := sanitizeLogValue(r.Header.Get("X-Actor-Email"))
+		target := sanitizeLogValue(email)
+		log.Printf("SA %s requested actor=%q target=%q", action, actor, target)
+
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		defer cancel()
+
+		// `projects/-/serviceAccounts/<email>` 形式で叩く (`-` で project は
+		// SA email から自動推論される、IAM Admin API のお作法)。
+		saName := fmt.Sprintf("projects/-/serviceAccounts/%s", email)
+		if err := l.SetServiceAccountDisabled(ctx, saName, disabled); err != nil {
+			log.Printf("SA %s failed actor=%q target=%q err=%v", action, actor, target, err)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+		log.Printf("SA %s ok actor=%q target=%q", action, actor, target)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+}
+
+// sanitizeLogValue は log injection 対策。改行 / CR を削除し長さも制限する。
+// principalEmail / target はどちらも外部 (Worker / GCP) から来るので、悪意ある
+// payload で log 行を偽装される可能性を構造的に排除する。
+func sanitizeLogValue(s string) string {
+	s = strings.ReplaceAll(s, "\n", "")
+	s = strings.ReplaceAll(s, "\r", "")
+	if len(s) > 256 {
+		s = s[:256] + "..."
+	}
+	return s
 }
 
 func handleListSecrets(l secretLister, projectID string) http.Handler {

@@ -77,10 +77,19 @@ type fakeIAMLister struct {
 	keysErr    error
 	keysErrFor string
 
+	// SetServiceAccountDisabled の挙動制御。`disableErr` non-nil で常に error。
+	disableErr error
+
 	// 観測用
-	gotProject string
+	gotProject       string
 	gotPolicyProject string
-	keyCalls   []string
+	keyCalls         []string
+	disableCalls     []disableCall
+}
+
+type disableCall struct {
+	saName   string
+	disabled bool
 }
 
 func (f *fakeIAMLister) ListServiceAccounts(_ context.Context, project string) ([]*adminpb.ServiceAccount, error) {
@@ -107,6 +116,13 @@ func (f *fakeIAMLister) ListServiceAccountKeys(_ context.Context, saName string)
 func (f *fakeIAMLister) GetProjectIamPolicy(_ context.Context, project string) (*iampb.Policy, error) {
 	f.gotPolicyProject = project
 	return f.policy, f.polErr
+}
+
+func (f *fakeIAMLister) SetServiceAccountDisabled(_ context.Context, saName string, disabled bool) error {
+	f.mu.Lock()
+	f.disableCalls = append(f.disableCalls, disableCall{saName: saName, disabled: disabled})
+	f.mu.Unlock()
+	return f.disableErr
 }
 
 func TestShortName(t *testing.T) {
@@ -795,5 +811,117 @@ func TestListServiceAccountsMissingActivityForOneSA(t *testing.T) {
 	}
 	if got := byEmail["sa-b@p.iam.gserviceaccount.com"]; got != "2026-05-01T07:00:00Z" {
 		t.Errorf("sa-b LastAuthenticatedAt = %q, want 2026-05-01T07:00:00Z", got)
+	}
+}
+
+// ------------------------------------------------------------
+// /sa-disable / /sa-enable endpoints
+// ------------------------------------------------------------
+
+func TestSanitizeLogValue(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"normal@example.com", "normal@example.com"},
+		{"with\nnewline", "withnewline"},
+		{"with\r\ncrlf", "withcrlf"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := sanitizeLogValue(c.in); got != c.want {
+			t.Errorf("sanitizeLogValue(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	long := make([]byte, 300)
+	for i := range long {
+		long[i] = 'x'
+	}
+	got := sanitizeLogValue(string(long))
+	if len(got) != 256+len("...") {
+		t.Errorf("sanitizeLogValue trim len = %d, want %d", len(got), 256+len("..."))
+	}
+}
+
+func TestSaDisable(t *testing.T) {
+	fakeIAM := &fakeIAMLister{}
+	mux := newMuxWith(&fakeLister{}, fakeIAM, &fakeActivityLister{}, "p", "topsecret")
+	req := httptest.NewRequest(http.MethodPost, "/sa-disable?email=foo@p.iam.gserviceaccount.com", nil)
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	req.Header.Set("X-Actor-Email", "actor@example.com")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if len(fakeIAM.disableCalls) != 1 {
+		t.Fatalf("disableCalls len = %d", len(fakeIAM.disableCalls))
+	}
+	got := fakeIAM.disableCalls[0]
+	if got.saName != "projects/-/serviceAccounts/foo@p.iam.gserviceaccount.com" {
+		t.Errorf("saName = %q", got.saName)
+	}
+	if !got.disabled {
+		t.Errorf("disabled = false, want true (disable endpoint should set true)")
+	}
+	if !strings.Contains(rec.Body.String(), `"ok":true`) {
+		t.Errorf("body = %s", rec.Body.String())
+	}
+}
+
+func TestSaEnable(t *testing.T) {
+	fakeIAM := &fakeIAMLister{}
+	mux := newMuxWith(&fakeLister{}, fakeIAM, &fakeActivityLister{}, "p", "topsecret")
+	req := httptest.NewRequest(http.MethodPost, "/sa-enable?email=bar@p.iam.gserviceaccount.com", nil)
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if len(fakeIAM.disableCalls) != 1 || fakeIAM.disableCalls[0].disabled {
+		t.Fatalf("calls = %+v (want 1 call with disabled=false)", fakeIAM.disableCalls)
+	}
+}
+
+func TestSaDisableRequiresAPIKey(t *testing.T) {
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	req := httptest.NewRequest(http.MethodPost, "/sa-disable?email=foo@p.iam.gserviceaccount.com", nil)
+	// no X-Inventory-API-Key
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestSaDisableRejectsGET(t *testing.T) {
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	req := httptest.NewRequest(http.MethodGet, "/sa-disable?email=foo@p.iam.gserviceaccount.com", nil)
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", rec.Code)
+	}
+}
+
+func TestSaDisableMissingEmail(t *testing.T) {
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	req := httptest.NewRequest(http.MethodPost, "/sa-disable", nil)
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestSaDisableUpstreamError(t *testing.T) {
+	fakeIAM := &fakeIAMLister{disableErr: errors.New("permission denied")}
+	mux := newMuxWith(&fakeLister{}, fakeIAM, &fakeActivityLister{}, "p", "topsecret")
+	req := httptest.NewRequest(http.MethodPost, "/sa-disable?email=foo@p.iam.gserviceaccount.com", nil)
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", rec.Code)
 	}
 }

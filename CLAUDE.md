@@ -38,14 +38,21 @@ PR テンプレートは `.github/pull_request_template.md` で `Refs` を強制
   inventory-runtime*`) + ADC (metadata server) で runtime credential を取り、
   GitHub Actions → GCP の deploy credential も **WIF (GitHub OIDC trust)**
   で mint する。レポジトリシークレットに GCP key を置かない。
-- runtime SA に付与する IAM role は **read-only に限定**:
+- runtime SA に付与する IAM role は **read-only を基本に**:
   - `roles/secretmanager.viewer` (Secret Manager メタデータ)
   - `roles/iam.securityReviewer` (SA 一覧 + project IAM policy + 各 SA の key 一覧)
   - `roles/policyanalyzer.activityAnalysisViewer` (Policy Analyzer の SA 最終認証時刻 read-only)
-  `accessor` (= 値の取得) は付けない。書き込み系の role も付けない
+  - **(例外) `iam.serviceAccounts.disable` + `.enable` のみ custom role で許可**
+    — pause / 即時復元用途、reversible なので付与する (下記 write 例外を参照)。
+    `accessor` (= 値の取得) や delete / create は付けない
 - 親 repo Worker からの呼び出しは `X-Inventory-API-Key` header 経由の
   shared secret 認証 (constant-time 比較)
-- write 系 (create / update / delete) のエンドポイントは追加しない
+- **write 系のうち SA の `disable` / `enable` のみ例外的に許可**。`delete`
+  / `create` / role 変更 / value 書き換えは引き続き禁止。disable は
+  reversible (= 即 enable で復元) なため操作コストが極めて低く、テスト・
+  即時復元用途専用と位置付ける。`POST /sa-disable?email=<sa>` / `/sa-enable`
+  で実装、`X-Actor-Email` header に実操作者 (CF Access JWT claim) を載せ、
+  proxy 側 application log で audit trail を残す
 
 ## 環境
 
