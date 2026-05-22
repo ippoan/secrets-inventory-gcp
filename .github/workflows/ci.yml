@@ -37,6 +37,12 @@ jobs:
       gcp_secret_verify_project: cloudsql-sv
       gcp_secret_verify_provider: ${{ vars.GCP_WIF_PROVIDER }}
       gcp_secret_verify_sa: ${{ vars.GCP_WIF_SERVICE_ACCOUNT_STAGING }}
+      # verify pass 後に `used-by-ippoan-secrets-inventory-gcp=active|removed`
+      # label を GCP Secret Manager の宣言 secret に打つ。撤退時は `removed`
+      # に flip して audit trail を残す。ci-workflows#39 で追加された opt-in。
+      # `staging-deploy@cloudsql-sv` には custom role `secretsInventoryLabeler`
+      # (`secretmanager.secrets.update` + `.get`) を grant 済み。Refs #17.
+      gcp_secret_verify_apply_labels: true
 
   # GHCR への image push。non-draft PR と main push、v* tag push で走る。
   # ippoan の Cloud Run deploy 標準パターン (ci-workflows/cloud-run-
