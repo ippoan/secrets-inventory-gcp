@@ -1,9 +1,11 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
+  # `push: main` / `tags: v*` は意図的に declare しない:
+  #   - PR merge 後の main push で重複 CI run が走るのを排除
+  #   - production は使わない (staging = prod 運用) ため tag deploy 不要
+  # staging deploy は `pull_request` event の `deploy-staging` job が
+  # PR open / synchronize 時に動かす (= merge 前に PR で staging 反映)。
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
@@ -75,9 +77,7 @@ jobs:
   # image tag は github.sha (short) で固定 — deploy 側で digest を解決する
   # ので tag のスタブ性は問題にならない。
   build-image:
-    if: |
-      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) ||
-      (github.event_name == 'pull_request' && github.event.pull_request.draft != true)
+    if: github.event.pull_request.draft != true
     needs: [ci]
     runs-on: ubuntu-latest
     permissions:
@@ -133,10 +133,8 @@ jobs:
     if: |
       vars.GCP_PROJECT_ID_STAGING != '' &&
       vars.GCP_WIF_PROVIDER != '' &&
-      vars.GCP_WIF_SERVICE_ACCOUNT_STAGING != '' && (
-        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-        (github.event_name == 'pull_request' && github.event.pull_request.draft != true)
-      )
+      vars.GCP_WIF_SERVICE_ACCOUNT_STAGING != '' &&
+      github.event.pull_request.draft != true
     needs: [ci, build-image]
     permissions:
       contents: read
@@ -155,33 +153,3 @@ jobs:
       runtime_service_account: secrets-inventory-viewer@cloudsql-sv.iam.gserviceaccount.com
       set_env_vars: GCP_PROJECT_ID=${{ vars.GCP_PROJECT_ID_STAGING }}
       update_secrets: INVENTORY_API_KEY=SECRETS_INVENTORY_GCP_PROXY_API_KEY_STAGING:latest
-
-  # production は v* タグでのみ deploy。staging と同じ WIF provider を使い、
-  # SA だけ prod 用 (`vars.GCP_WIF_SERVICE_ACCOUNT`) に切り替える。
-  # secret 名も prod 版: `SECRETS_INVENTORY_GCP_PROXY_API_KEY` (suffix なし)。
-  # runtime SA は staging と共通の `secrets-inventory-viewer@cloudsql-sv`
-  # (CLAUDE.md で 「staging と prod で同じ viewer SA」 方針)。
-  deploy-production:
-    if: |
-      vars.GCP_PROJECT_ID != '' &&
-      vars.GCP_WIF_PROVIDER != '' &&
-      vars.GCP_WIF_SERVICE_ACCOUNT != '' &&
-      startsWith(github.ref, 'refs/tags/v')
-    needs: [ci, build-image]
-    permissions:
-      contents: read
-      packages: read
-      id-token: write
-    uses: ippoan/ci-workflows/.github/workflows/cloud-run-deploy.yml@main
-    with:
-      service: secrets-inventory-gcp
-      region: ${{ vars.GCP_REGION }}
-      project: ${{ vars.GCP_PROJECT_ID }}
-      ghcr_image: ghcr.io/ippoan/secrets-inventory-gcp
-      image_tag: ${{ needs.build-image.outputs.image_tag }}
-      ar_repo: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/ghcr/ippoan/secrets-inventory-gcp
-      workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
-      service_account: ${{ vars.GCP_WIF_SERVICE_ACCOUNT }}
-      runtime_service_account: secrets-inventory-viewer@cloudsql-sv.iam.gserviceaccount.com
-      set_env_vars: GCP_PROJECT_ID=${{ vars.GCP_PROJECT_ID }}
-      update_secrets: INVENTORY_API_KEY=SECRETS_INVENTORY_GCP_PROXY_API_KEY:latest
