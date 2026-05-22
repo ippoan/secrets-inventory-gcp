@@ -38,8 +38,11 @@ PR テンプレートは `.github/pull_request_template.md` で `Refs` を強制
   inventory-runtime*`) + ADC (metadata server) で runtime credential を取り、
   GitHub Actions → GCP の deploy credential も **WIF (GitHub OIDC trust)**
   で mint する。レポジトリシークレットに GCP key を置かない。
-- runtime SA に付与する IAM role は `roles/secretmanager.viewer` のみ。
-  `accessor` (値の取得) は付けない
+- runtime SA に付与する IAM role は **read-only に限定**:
+  - `roles/secretmanager.viewer` (Secret Manager メタデータ)
+  - `roles/iam.securityReviewer` (SA 一覧 + project IAM policy + 各 SA の key 一覧)
+  - `roles/policy-analyzer.activityViewer` (Policy Analyzer の SA 最終認証時刻)
+  `accessor` (= 値の取得) は付けない。書き込み系の role も付けない
 - 親 repo Worker からの呼び出しは `X-Inventory-API-Key` header 経由の
   shared secret 認証 (constant-time 比較)
 - write 系 (create / update / delete) のエンドポイントは追加しない

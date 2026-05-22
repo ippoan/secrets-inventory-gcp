@@ -43,6 +43,26 @@ func (f *fakeLister) LatestVersionCreateTime(_ context.Context, secretName strin
 	return f.versionTimes[secretName], nil
 }
 
+// fakeActivityLister は saActivityLister の test 用 fake。`lastAuth` を
+// SA email → RFC3339 で渡せば handler の取得結果を制御できる。`err` non-nil
+// なら graceful degrade path (last_authenticated_at が全 SA で空文字) を
+// 検証できる。
+type fakeActivityLister struct {
+	lastAuth map[string]string
+	err      error
+
+	// 観測用
+	gotProject string
+}
+
+func (f *fakeActivityLister) LastAuthenticatedTimes(_ context.Context, project string) (map[string]string, error) {
+	f.gotProject = project
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.lastAuth, nil
+}
+
 type fakeIAMLister struct {
 	mu sync.Mutex
 
@@ -117,7 +137,7 @@ func TestTsToRFC3339(t *testing.T) {
 }
 
 func TestHealth(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, "p", "k")
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "k")
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -130,7 +150,7 @@ func TestHealth(t *testing.T) {
 }
 
 func TestListSecretsRequiresAPIKey(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, "p", "topsecret")
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 
 	// no header
 	req := httptest.NewRequest(http.MethodGet, "/list-secrets", nil)
@@ -151,7 +171,7 @@ func TestListSecretsRequiresAPIKey(t *testing.T) {
 }
 
 func TestListSecretsRejectsNonGet(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, "p", "topsecret")
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodPost, "/list-secrets", nil)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	rec := httptest.NewRecorder()
@@ -174,7 +194,7 @@ func TestListSecretsOK(t *testing.T) {
 			"projects/p/secrets/A": rotA,
 		},
 	}
-	mux := newMuxWith(f, &fakeIAMLister{}, "p", "topsecret")
+	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 
 	req := httptest.NewRequest(http.MethodGet, "/list-secrets", nil)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
@@ -223,7 +243,7 @@ func TestListSecretsVersionFetchFailDegradesToEmpty(t *testing.T) {
 		},
 		versionErr: errors.New("simulated version API failure"),
 	}
-	mux := newMuxWith(f, &fakeIAMLister{}, "p", "topsecret")
+	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 
 	req := httptest.NewRequest(http.MethodGet, "/list-secrets", nil)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
@@ -249,7 +269,7 @@ func TestListSecretsVersionFetchFailDegradesToEmpty(t *testing.T) {
 }
 
 func TestListSecretsUpstreamError(t *testing.T) {
-	mux := newMuxWith(&fakeLister{err: errors.New("boom")}, &fakeIAMLister{}, "p", "topsecret")
+	mux := newMuxWith(&fakeLister{err: errors.New("boom")}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodGet, "/list-secrets", nil)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	rec := httptest.NewRecorder()
@@ -264,7 +284,7 @@ func TestListSecretsUpstreamError(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 func TestListServiceAccountsRequiresAPIKey(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, "p", "topsecret")
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodGet, "/list-service-accounts", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -274,7 +294,7 @@ func TestListServiceAccountsRequiresAPIKey(t *testing.T) {
 }
 
 func TestListServiceAccountsRejectsNonGet(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, "p", "topsecret")
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodPost, "/list-service-accounts", nil)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	rec := httptest.NewRecorder()
@@ -335,7 +355,7 @@ func TestListServiceAccountsOK(t *testing.T) {
 			},
 		},
 	}
-	mux := newMuxWith(&fakeLister{}, fakeIAM, "p", "topsecret")
+	mux := newMuxWith(&fakeLister{}, fakeIAM, &fakeActivityLister{}, "p", "topsecret")
 
 	req := httptest.NewRequest(http.MethodGet, "/list-service-accounts", nil)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
@@ -409,7 +429,7 @@ func TestListServiceAccountsOK(t *testing.T) {
 }
 
 func TestListServiceAccountsUpstreamError(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{saErr: errors.New("boom")}, "p", "topsecret")
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{saErr: errors.New("boom")}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodGet, "/list-service-accounts", nil)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	rec := httptest.NewRecorder()
@@ -428,7 +448,7 @@ func TestListServiceAccountsPolicyFailDegrades(t *testing.T) {
 	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{
 		sas:    []*adminpb.ServiceAccount{sa},
 		polErr: errors.New("simulated policy fetch failure"),
-	}, "p", "topsecret")
+	}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodGet, "/list-service-accounts", nil)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	rec := httptest.NewRecorder()
@@ -468,7 +488,7 @@ func TestListServiceAccountsKeysFailDegrades(t *testing.T) {
 			},
 		},
 		keysErrFor: "projects/p/serviceAccounts/sa-a@p.iam.gserviceaccount.com",
-	}, "p", "topsecret")
+	}, &fakeActivityLister{}, "p", "topsecret")
 
 	req := httptest.NewRequest(http.MethodGet, "/list-service-accounts", nil)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
@@ -498,7 +518,7 @@ func TestListServiceAccountsAllKeysFailDegrades(t *testing.T) {
 	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{
 		sas:     []*adminpb.ServiceAccount{sa},
 		keysErr: errors.New("simulated global key fetch failure"),
-	}, "p", "topsecret")
+	}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodGet, "/list-service-accounts", nil)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	rec := httptest.NewRecorder()
@@ -617,5 +637,163 @@ func TestEmptyHelpers(t *testing.T) {
 	}
 	if got := emptyKeysIfNil([]saKeyItem{{Id: "x"}}); len(got) != 1 {
 		t.Errorf("emptyKeysIfNil passthrough = %v", got)
+	}
+}
+
+func TestSaEmailFromFullResourceName(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{
+			in:   "//iam.googleapis.com/projects/cloudsql-sv/serviceAccounts/sa@cloudsql-sv.iam.gserviceaccount.com",
+			want: "sa@cloudsql-sv.iam.gserviceaccount.com",
+		},
+		{
+			in:   "//iam.googleapis.com/projects/p/serviceAccounts/x",
+			want: "x",
+		},
+		{in: "noslash", want: ""},
+		{in: "", want: ""},
+	}
+	for _, c := range cases {
+		if got := saEmailFromFullResourceName(c.in); got != c.want {
+			t.Errorf("saEmailFromFullResourceName(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestParseLastAuthenticatedTime(t *testing.T) {
+	t.Run("typical activity payload", func(t *testing.T) {
+		raw := []byte(`{"lastAuthenticatedTime":"2026-04-28T07:00:00Z","serviceAccount":{"projectNumber":"1"}}`)
+		ts, ok := parseLastAuthenticatedTime(raw)
+		if !ok || ts != "2026-04-28T07:00:00Z" {
+			t.Fatalf("got (%q, %v), want (2026-04-28T07:00:00Z, true)", ts, ok)
+		}
+	})
+	t.Run("missing field returns empty string but ok=true", func(t *testing.T) {
+		raw := []byte(`{"serviceAccount":{"projectNumber":"1"}}`)
+		ts, ok := parseLastAuthenticatedTime(raw)
+		if !ok || ts != "" {
+			t.Fatalf("got (%q, %v), want (\"\", true)", ts, ok)
+		}
+	})
+	t.Run("empty input", func(t *testing.T) {
+		ts, ok := parseLastAuthenticatedTime(nil)
+		if ok || ts != "" {
+			t.Fatalf("got (%q, %v), want (\"\", false)", ts, ok)
+		}
+	})
+	t.Run("malformed json", func(t *testing.T) {
+		ts, ok := parseLastAuthenticatedTime([]byte("not-json"))
+		if ok || ts != "" {
+			t.Fatalf("got (%q, %v), want (\"\", false)", ts, ok)
+		}
+	})
+}
+
+func TestListServiceAccountsIncludesLastAuthenticatedAt(t *testing.T) {
+	sa := &adminpb.ServiceAccount{
+		Name:  "projects/p/serviceAccounts/sa-x@p.iam.gserviceaccount.com",
+		Email: "sa-x@p.iam.gserviceaccount.com",
+	}
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{
+		sas: []*adminpb.ServiceAccount{sa},
+	}, &fakeActivityLister{
+		lastAuth: map[string]string{
+			"sa-x@p.iam.gserviceaccount.com": "2026-04-28T07:00:00Z",
+		},
+	}, "p", "topsecret")
+	req := httptest.NewRequest(http.MethodGet, "/list-service-accounts", nil)
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var resp listServiceAccountsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.ServiceAccounts) != 1 {
+		t.Fatalf("len = %d", len(resp.ServiceAccounts))
+	}
+	if got := resp.ServiceAccounts[0].LastAuthenticatedAt; got != "2026-04-28T07:00:00Z" {
+		t.Errorf("LastAuthenticatedAt = %q, want 2026-04-28T07:00:00Z", got)
+	}
+}
+
+func TestListServiceAccountsActivityErrorDegradesGracefully(t *testing.T) {
+	// Policy Analyzer 失敗時は SA 一覧は返るが last_authenticated_at は全 SA で空。
+	// secrets の updated_at degrade pattern と同じ挙動。
+	sa := &adminpb.ServiceAccount{
+		Name:  "projects/p/serviceAccounts/sa-x@p.iam.gserviceaccount.com",
+		Email: "sa-x@p.iam.gserviceaccount.com",
+	}
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{
+		sas: []*adminpb.ServiceAccount{sa},
+	}, &fakeActivityLister{
+		err: errors.New("simulated policy analyzer permission denied"),
+	}, "p", "topsecret")
+	req := httptest.NewRequest(http.MethodGet, "/list-service-accounts", nil)
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (graceful degrade)", rec.Code)
+	}
+	var resp listServiceAccountsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.ServiceAccounts) != 1 {
+		t.Fatalf("len = %d", len(resp.ServiceAccounts))
+	}
+	if got := resp.ServiceAccounts[0].LastAuthenticatedAt; got != "" {
+		t.Errorf("LastAuthenticatedAt = %q on activity error, want empty (degrade)", got)
+	}
+}
+
+func TestListServiceAccountsMissingActivityForOneSA(t *testing.T) {
+	// 2 SA 中 1 SA だけ Policy Analyzer に活動履歴がある (= 残り 1 つは未認証
+	// or 期間外)。missing 側は空文字を expose する。
+	saA := &adminpb.ServiceAccount{
+		Name:  "projects/p/serviceAccounts/sa-a@p.iam.gserviceaccount.com",
+		Email: "sa-a@p.iam.gserviceaccount.com",
+	}
+	saB := &adminpb.ServiceAccount{
+		Name:  "projects/p/serviceAccounts/sa-b@p.iam.gserviceaccount.com",
+		Email: "sa-b@p.iam.gserviceaccount.com",
+	}
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{
+		sas: []*adminpb.ServiceAccount{saA, saB},
+	}, &fakeActivityLister{
+		lastAuth: map[string]string{
+			"sa-b@p.iam.gserviceaccount.com": "2026-05-01T07:00:00Z",
+		},
+	}, "p", "topsecret")
+	req := httptest.NewRequest(http.MethodGet, "/list-service-accounts", nil)
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var resp listServiceAccountsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.ServiceAccounts) != 2 {
+		t.Fatalf("len = %d", len(resp.ServiceAccounts))
+	}
+	byEmail := map[string]string{}
+	for _, sa := range resp.ServiceAccounts {
+		byEmail[sa.Email] = sa.LastAuthenticatedAt
+	}
+	if got := byEmail["sa-a@p.iam.gserviceaccount.com"]; got != "" {
+		t.Errorf("sa-a LastAuthenticatedAt = %q, want empty", got)
+	}
+	if got := byEmail["sa-b@p.iam.gserviceaccount.com"]; got != "2026-05-01T07:00:00Z" {
+		t.Errorf("sa-b LastAuthenticatedAt = %q, want 2026-05-01T07:00:00Z", got)
 	}
 }
