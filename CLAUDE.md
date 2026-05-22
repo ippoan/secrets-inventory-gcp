@@ -85,44 +85,53 @@ cloud-run-deploy.yml` reusable で **AR remote-repo (pull-through cache)
 既存 リソースをできるだけ流用するが、Deployer SA は WIF 専用として新規
 作成する。
 
-- **WIF Pool + Provider** (新規):
+- **WIF Pool + Provider** (既存、`gh-actions-pool` / `github`):
   ```bash
   PROJECT=cloudsql-sv
-  POOL=github
-  PROVIDER=ippoan
+  POOL=gh-actions-pool
+  PROVIDER=github
 
-  gcloud iam workload-identity-pools create "$POOL" \
-    --project="$PROJECT" --location=global \
-    --display-name="GitHub Actions"
+  # (既に存在する場合は describe で確認するだけ)
+  gcloud iam workload-identity-pools describe "$POOL" \
+    --project="$PROJECT" --location=global
 
-  gcloud iam workload-identity-pools providers create-oidc "$PROVIDER" \
-    --project="$PROJECT" --location=global \
-    --workload-identity-pool="$POOL" \
-    --display-name="ippoan org OIDC" \
-    --issuer-uri="https://token.actions.githubusercontent.com" \
-    --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.ref=assertion.ref" \
-    --attribute-condition="assertion.repository_owner=='ippoan'"
+  gcloud iam workload-identity-pools providers describe "$PROVIDER" \
+    --project="$PROJECT" --location=global --workload-identity-pool="$POOL"
   ```
-  full path: `projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/github/providers/ippoan`
+  full path: `projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/gh-actions-pool/providers/github`
 
-- **Deployer SA** (`cloud-run-deployer-staging@cloudsql-sv.iam.gserviceaccount.com`):
+  attribute_condition は `assertion.repository_owner == 'ippoan'` で
+  ippoan org 配下の全 repo を受け入れる (個別 repo の impersonation 制御は
+  SA-level の workloadIdentityUser binding で行う設計)。
+
+- **Deployer SA** (`staging-deploy@cloudsql-sv.iam.gserviceaccount.com`):
+  - display name: `Staging Deploy (GitHub Actions)`
   - role: `roles/run.admin`, `roles/iam.serviceAccountUser` (Cloud Run に
-    runtime SA を attach するため), `roles/artifactregistry.reader`
-  - **JSON key は発行しない**
-  - WIF principal binding (`secrets-inventory-gcp` repo だけから impersonate 可):
+    runtime SA を attach するため), `roles/artifactregistry.reader`,
+    `roles/secretmanager.viewer` (secret-verify 用),
+    `projects/cloudsql-sv/roles/secretsInventoryLabeler` (apply_labels 用
+    custom role、`secretmanager.secrets.update` + `.get`),
+    `roles/secretmanager.secretAccessor` (Cloud Run deploy 時 secret 注入用),
+    `roles/logging.logWriter`, `roles/logging.viewer`, `roles/cloudfunctions.viewer`
+  - **JSON key は発行しない** (system-managed key のみ、user-managed key の
+    自動 rotation は GCP 側に任せる)
+  - WIF principal binding (`secrets-inventory-gcp` と `secrets-inventory`
+    の 2 repo から impersonate 可、新 repo を追加するときは binding を 1 行
+    増やす):
     ```bash
     PROJECT_NUMBER=$(gcloud projects describe cloudsql-sv --format='value(projectNumber)')
-    PRINCIPAL="principalSet://iam.googleapis.com/projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/github/attribute.repository/ippoan/secrets-inventory-gcp"
 
-    gcloud iam service-accounts add-iam-policy-binding \
-      cloud-run-deployer-staging@cloudsql-sv.iam.gserviceaccount.com \
-      --project=cloudsql-sv \
-      --role="roles/iam.workloadIdentityUser" \
-      --member="$PRINCIPAL"
+    for REPO in ippoan/secrets-inventory-gcp ippoan/secrets-inventory; do
+      gcloud iam service-accounts add-iam-policy-binding \
+        staging-deploy@cloudsql-sv.iam.gserviceaccount.com \
+        --project=cloudsql-sv \
+        --role="roles/iam.workloadIdentityUser" \
+        --member="principalSet://iam.googleapis.com/projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/gh-actions-pool/attribute.repository/$REPO"
+    done
     ```
-  - prod 用 (`cloud-run-deployer@cloudsql-sv.iam.gserviceaccount.com`) も
-    同様に作成 + WIF binding。`v*` tag push でだけ使うので連動するのは
-    production deploy を始めるタイミングでよい。
+  - prod 用 (`cloud-run-deployer@cloudsql-sv.iam.gserviceaccount.com` 等)
+    は production deploy を始めるタイミングで別 SA + WIF binding を作る。
+    `v*` tag push でだけ使う想定。
 
 - **Runtime SA (Cloud Run attached)**:
   `secrets-inventory-viewer@cloudsql-sv.iam.gserviceaccount.com` (既存、
@@ -176,9 +185,10 @@ gcloud run deploy secrets-inventory-gcp-staging \
 - `GCP_REGION` = `asia-northeast1`
 - `GCP_PROJECT_ID_STAGING` = `cloudsql-sv`
 - `GCP_WIF_PROVIDER` =
-  `projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/github/providers/ippoan`
+  `projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/gh-actions-pool/providers/github`
 - `GCP_WIF_SERVICE_ACCOUNT_STAGING` =
-  `cloud-run-deployer-staging@cloudsql-sv.iam.gserviceaccount.com`
+  `staging-deploy@cloudsql-sv.iam.gserviceaccount.com`
+  (org-level vars として登録済 = `ippoan` org 配下の全 public repo で共有)
 - (production を動かす段階で `GCP_PROJECT_ID` と
   `GCP_WIF_SERVICE_ACCOUNT` も追加)
 
