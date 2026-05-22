@@ -24,6 +24,9 @@ jobs:
   ci:
     if: github.event.pull_request.draft != true
     uses: ippoan/ci-workflows/.github/workflows/go-ci.yml@main
+    permissions:
+      contents: read
+      id-token: write   # nested `secret-verify` job が WIF OIDC token を mint するため
     with:
       # GCP Secret Manager verify を **ci の直列後段** に組み込む。go-ci.yml
       # 側 (ci-workflows#38) で `secret-verify` job が `needs: [vet, test,
