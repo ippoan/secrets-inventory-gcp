@@ -13,6 +13,30 @@ permissions:
   packages: write   # build-image で GHCR push に必要
 
 jobs:
+  # PR auto-merge を **CI 開始時に強制 disable** する。本 repo の branch
+  # protection が required check に `ci / secret-verify` を含めていなかった
+  # 期間 (Refs #21)、`enable_pr_auto_merge` API call → 数秒後 CI fail 状態
+  # で merge 完了、という事故が発生 (= PR #20)。本 job は人間 / bot が
+  # GH UI / API で auto-merge を enable しても即座に disable し、merge は
+  # 必ず明示的な「UI の merge ボタン押下」or `gh pr merge` でのみ可能、
+  # = **CI 結果を目視確認してから merge** する運用に強制移行する。
+  #
+  # `|| true` は「既に disable」「PR closed」等の no-op エラーを握り潰す
+  # 用途。本 job 自体が fail することはほぼ無い。
+  disable-auto-merge:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Force-disable PR auto-merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh pr merge --disable-auto "$PR_NUMBER" -R "$REPO" || true
+
   # `ippoan/ci-workflows/.github/workflows/go-ci.yml` の 3 job (vet / test /
   # build) を `ci` job id 配下に呼び出す。status check 名は caller job id
   # + ' / ' + reusable job name で:
