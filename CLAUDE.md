@@ -41,7 +41,7 @@ PR テンプレートは `.github/pull_request_template.md` で `Refs` を強制
 - runtime SA に付与する IAM role は **read-only に限定**:
   - `roles/secretmanager.viewer` (Secret Manager メタデータ)
   - `roles/iam.securityReviewer` (SA 一覧 + project IAM policy + 各 SA の key 一覧)
-  - `roles/policy-analyzer.activityViewer` (Policy Analyzer の SA 最終認証時刻)
+  - `roles/policyanalyzer.activityAnalysisViewer` (Policy Analyzer の SA 最終認証時刻 read-only)
   `accessor` (= 値の取得) は付けない。書き込み系の role も付けない
 - 親 repo Worker からの呼び出しは `X-Inventory-API-Key` header 経由の
   shared secret 認証 (constant-time 比較)
