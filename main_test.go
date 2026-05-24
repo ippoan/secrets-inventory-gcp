@@ -42,11 +42,23 @@ type fakeLister struct {
 	addedVersions    []addCall
 	addVersionErr    error
 	addVersionNameFn func(secretName string) string
+
+	// CreateSecret の挙動。`existingSecrets` に含まれる short name は
+	// `alreadyExists=true` を返す。`createSecretErr` non-nil で他の全ての
+	// create が error。`createCalls` に呼び出しを記録。
+	existingSecrets map[string]bool
+	createSecretErr error
+	createCalls     []createCall
 }
 
 type addCall struct {
 	secretName string
 	value      []byte
+}
+
+type createCall struct {
+	parent    string
+	shortName string
 }
 
 func (f *fakeLister) ListSecrets(_ context.Context, parent string) ([]*secretmanagerpb.Secret, error) {
@@ -88,6 +100,19 @@ func (f *fakeLister) AddSecretVersion(_ context.Context, secretName string, valu
 		return f.addVersionNameFn(secretName), nil
 	}
 	return secretName + "/versions/MOCK", nil
+}
+
+func (f *fakeLister) CreateSecret(_ context.Context, parent, shortName string) (string, bool, error) {
+	f.mu.Lock()
+	f.createCalls = append(f.createCalls, createCall{parent: parent, shortName: shortName})
+	f.mu.Unlock()
+	if f.createSecretErr != nil {
+		return "", false, f.createSecretErr
+	}
+	if f.existingSecrets != nil && f.existingSecrets[shortName] {
+		return parent + "/secrets/" + shortName, true, nil
+	}
+	return parent + "/secrets/" + shortName, false, nil
 }
 
 // fakeActivityLister は saActivityLister の test 用 fake。`lastAuth` を
@@ -1427,5 +1452,305 @@ func TestAddVersionTOCTOULongActual(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusConflict {
 		t.Errorf("status = %d, want 409", rec.Code)
+	}
+}
+
+// ------------------------------------------------------------
+// /create-secret endpoint (= rotate-mcp の create_secret tool が叩く)
+// ------------------------------------------------------------
+
+func TestCreateSecretRequiresAPIKey(t *testing.T) {
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=NEW", strings.NewReader(`{"value":"v"}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestCreateSecretRejectsNonPOST(t *testing.T) {
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	req := httptest.NewRequest(http.MethodGet, "/create-secret?name=NEW", nil)
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", rec.Code)
+	}
+}
+
+func TestCreateSecretMissingName(t *testing.T) {
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	req := httptest.NewRequest(http.MethodPost, "/create-secret", strings.NewReader(`{"value":"v"}`))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestCreateSecretInvalidName(t *testing.T) {
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	for _, bad := range []string{"NEW/X", "1NEW", "_X", strings.Repeat("x", 129)} {
+		t.Run(bad, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/create-secret?name="+bad, strings.NewReader(`{"value":"v"}`))
+			req.Header.Set("X-Inventory-API-Key", "topsecret")
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("status = %d, want 400", rec.Code)
+			}
+		})
+	}
+}
+
+func TestCreateSecretInvalidFailIfExists(t *testing.T) {
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=NEW", strings.NewReader(`{"value":"v"}`))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	req.Header.Set("X-Fail-If-Exists", "maybe")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestCreateSecretMissingValue(t *testing.T) {
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=NEW", strings.NewReader(`{}`))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestCreateSecretMalformedBody(t *testing.T) {
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=NEW", strings.NewReader(`{not json`))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestCreateSecretValueTooLarge(t *testing.T) {
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	val := strings.Repeat("a", maxSecretValueBytes+1)
+	body, _ := json.Marshal(createSecretRequest{Value: val})
+	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=NEW", bytes.NewReader(body))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestCreateSecretBodyExceedsMaxBytesReader(t *testing.T) {
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	big := strings.Repeat("a", maxSecretValueBytes+2048)
+	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=NEW", strings.NewReader(big))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestCreateSecretOK(t *testing.T) {
+	f := &fakeLister{
+		addVersionNameFn: func(secretName string) string {
+			return secretName + "/versions/1"
+		},
+	}
+	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+
+	const secretValue = "secret-payload-do-not-log"
+	body, _ := json.Marshal(createSecretRequest{Value: secretValue})
+	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=NEW_SECRET", bytes.NewReader(body))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	req.Header.Set("X-Actor-Email", "actor@example.com")
+	rec := httptest.NewRecorder()
+
+	logBuf := captureLog(t)
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	var resp createSecretResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !resp.Ok || !resp.Created {
+		t.Errorf("ok / created = %+v", resp)
+	}
+	if resp.Name != "NEW_SECRET" {
+		t.Errorf("name = %q", resp.Name)
+	}
+	if resp.NewVersion != "projects/p/secrets/NEW_SECRET/versions/1" {
+		t.Errorf("new_version = %q", resp.NewVersion)
+	}
+
+	// CreateSecret + AddSecretVersion 各 1 回
+	if len(f.createCalls) != 1 {
+		t.Errorf("createCalls = %d", len(f.createCalls))
+	}
+	if f.createCalls[0].parent != "projects/p" || f.createCalls[0].shortName != "NEW_SECRET" {
+		t.Errorf("createCall = %+v", f.createCalls[0])
+	}
+	if len(f.addedVersions) != 1 {
+		t.Errorf("addedVersions = %d", len(f.addedVersions))
+	}
+	if string(f.addedVersions[0].value) != secretValue {
+		t.Errorf("value not forwarded")
+	}
+
+	// **値が response にも log にも echo されない**
+	if strings.Contains(rec.Body.String(), secretValue) {
+		t.Errorf("response leaked value: %s", rec.Body.String())
+	}
+	if strings.Contains(logBuf.String(), secretValue) {
+		t.Errorf("log leaked value: %s", logBuf.String())
+	}
+}
+
+func TestCreateSecretConflictWhenFailIfExistsDefault(t *testing.T) {
+	// fail_if_exists default = true。既存 secret 衝突は 409 で reject、
+	// AddVersion は呼ばない。
+	f := &fakeLister{
+		existingSecrets: map[string]bool{"EXISTING": true},
+	}
+	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	body, _ := json.Marshal(createSecretRequest{Value: "v"})
+	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=EXISTING", bytes.NewReader(body))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Errorf("status = %d, want 409", rec.Code)
+	}
+	if len(f.addedVersions) != 0 {
+		t.Errorf("expected 0 add-version calls on conflict, got %d", len(f.addedVersions))
+	}
+}
+
+func TestCreateSecretReuseWhenFailIfExistsFalse(t *testing.T) {
+	// X-Fail-If-Exists: false → 既存 secret 再利用、新 version 投入。
+	// response.created = false で見分けられる。
+	f := &fakeLister{
+		existingSecrets:  map[string]bool{"EXISTING": true},
+		addVersionNameFn: func(secretName string) string { return secretName + "/versions/5" },
+	}
+	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	body, _ := json.Marshal(createSecretRequest{Value: "v"})
+	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=EXISTING", bytes.NewReader(body))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	req.Header.Set("X-Fail-If-Exists", "false")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var resp createSecretResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Created {
+		t.Errorf("created = true, want false (reused existing)")
+	}
+	if resp.NewVersion != "projects/p/secrets/EXISTING/versions/5" {
+		t.Errorf("new_version = %q", resp.NewVersion)
+	}
+	if len(f.addedVersions) != 1 {
+		t.Errorf("addedVersions = %d", len(f.addedVersions))
+	}
+}
+
+func TestCreateSecretUpstreamErrorOnCreate(t *testing.T) {
+	f := &fakeLister{createSecretErr: errors.New("PERMISSION_DENIED creator role missing")}
+	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	body, _ := json.Marshal(createSecretRequest{Value: "v"})
+	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=NEW", bytes.NewReader(body))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", rec.Code)
+	}
+	// upstream error message は response body に echo しない
+	if strings.Contains(rec.Body.String(), "PERMISSION_DENIED") {
+		t.Errorf("response leaked upstream error: %s", rec.Body.String())
+	}
+}
+
+func TestCreateSecretUpstreamErrorOnAddVersion(t *testing.T) {
+	// CreateSecret は成功するが AddVersion で失敗するシナリオ (= 502)
+	f := &fakeLister{addVersionErr: errors.New("quota exceeded")}
+	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	body, _ := json.Marshal(createSecretRequest{Value: "v"})
+	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=NEW", bytes.NewReader(body))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", rec.Code)
+	}
+}
+
+func TestCreateSecretFailIfExistsAcceptsAliases(t *testing.T) {
+	// "true" / "false" / "1" / "0" / "yes" / "no" すべて受け付ける
+	cases := []struct {
+		header string
+		want   int
+	}{
+		{"true", http.StatusConflict},
+		{"1", http.StatusConflict},
+		{"yes", http.StatusConflict},
+		{"false", http.StatusOK},
+		{"0", http.StatusOK},
+		{"no", http.StatusOK},
+		{"False", http.StatusOK},
+		{"TRUE", http.StatusConflict},
+	}
+	for _, c := range cases {
+		t.Run(c.header, func(t *testing.T) {
+			f := &fakeLister{
+				existingSecrets:  map[string]bool{"EXISTING": true},
+				addVersionNameFn: func(secretName string) string { return secretName + "/versions/2" },
+			}
+			mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+			body, _ := json.Marshal(createSecretRequest{Value: "v"})
+			req := httptest.NewRequest(http.MethodPost, "/create-secret?name=EXISTING", bytes.NewReader(body))
+			req.Header.Set("X-Inventory-API-Key", "topsecret")
+			req.Header.Set("X-Fail-If-Exists", c.header)
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			if rec.Code != c.want {
+				t.Errorf("header=%q status = %d, want %d", c.header, rec.Code, c.want)
+			}
+		})
+	}
+}
+
+func TestCreateSecretEmptyBody(t *testing.T) {
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=NEW", http.NoBody)
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
 	}
 }
