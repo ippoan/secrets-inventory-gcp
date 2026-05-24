@@ -24,6 +24,8 @@ import (
 	"cloud.google.com/go/secretmanager/apiv1/secretmanagerpb"
 	"google.golang.org/api/iterator"
 	policyanalyzer "google.golang.org/api/policyanalyzer/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -101,6 +103,23 @@ type addVersionResponse struct {
 	NewVersion string `json:"new_version"`
 }
 
+// createSecretRequest は POST /create-secret の body。
+// `value` は **JSON body のみで運ぶ** (= add-version と同じ規約)。
+type createSecretRequest struct {
+	Value string `json:"value"`
+}
+
+// createSecretResponse は成功時の戻り値。
+// `name` = 短縮 secret name、`new_version` = GCP が割り当てた version 1 の
+// full resource name。fail_if_exists=false で既存 secret を再利用した場合も
+// `created=false` で同じ shape を返す。
+type createSecretResponse struct {
+	Ok         bool   `json:"ok"`
+	Name       string `json:"name"`
+	Created    bool   `json:"created"`
+	NewVersion string `json:"new_version"`
+}
+
 func main() {
 	projectID := mustEnv("GCP_PROJECT_ID")
 	apiKey := mustEnv("INVENTORY_API_KEY")
@@ -165,10 +184,10 @@ func mustEnv(key string) string {
 // secretLister は *secretmanager.Client の必要部分だけを切り出した interface。
 // テストでは fake を差し込めるようにするための薄い境界。
 //
-// 基本は read-only だが、`AddSecretVersion` のみ例外的に write を許す
-// (= secrets-rotate-mcp 経由の rotation 用)。SA は
-// `roles/secretmanager.secretVersionAdder` を限定 grant する想定。
-// `roles/secretmanager.admin` は与えない (= delete / create-secret は
+// 基本は read-only だが、`AddSecretVersion` + `CreateSecret` のみ例外的に
+// write を許す (= secrets-rotate-mcp 経由の rotation + new secret provisioning
+// 用)。SA は `roles/secretmanager.secretVersionAdder` + `secretCreator` を
+// 限定 grant する想定。`roles/secretmanager.admin` は与えない (= delete は
 // 引き続き禁止)。
 type secretLister interface {
 	ListSecrets(ctx context.Context, parent string) ([]*secretmanagerpb.Secret, error)
@@ -186,6 +205,18 @@ type secretLister interface {
 	// この interface 境界では []byte で受け、Secret Manager の
 	// SecretPayload.Data にそのまま渡す。
 	AddSecretVersion(ctx context.Context, secretName string, value []byte) (string, error)
+	// CreateSecret は parent (`projects/{p}`) 配下に short name の新 secret を
+	// 作成する (automatic replication 固定)。
+	//
+	// 返り値:
+	//   - createdName: 作成した secret の full name (`projects/.../secrets/{n}`)
+	//   - alreadyExists: true なら既存 secret 衝突 (= GCP の AlreadyExists 相当)。
+	//     この場合 createdName は full name を best-effort で組み立てて返す。
+	//   - err: それ以外の upstream error
+	//
+	// caller (handler) は alreadyExists + fail_if_exists を見て 409 or
+	// 再利用 (= 既存 secret に AddVersion を続行) を選ぶ。
+	CreateSecret(ctx context.Context, parent, shortName string) (createdName string, alreadyExists bool, err error)
 }
 
 type liveLister struct {
@@ -261,6 +292,33 @@ func (l *liveLister) AddSecretVersion(ctx context.Context, secretName string, va
 		return "", err
 	}
 	return v.GetName(), nil
+}
+
+// CreateSecret は automatic replication で新 secret を作成する。既存衝突は
+// gRPC `AlreadyExists` を `alreadyExists=true` に正規化して返し、caller が
+// 409 / 再利用を選べるようにする。`SecretId` は short name (e.g. `MY_SECRET`)、
+// `Parent` は `projects/{p}` 形式。
+func (l *liveLister) CreateSecret(ctx context.Context, parent, shortName string) (string, bool, error) {
+	s, err := l.c.CreateSecret(ctx, &secretmanagerpb.CreateSecretRequest{
+		Parent:   parent,
+		SecretId: shortName,
+		Secret: &secretmanagerpb.Secret{
+			Replication: &secretmanagerpb.Replication{
+				Replication: &secretmanagerpb.Replication_Automatic_{
+					Automatic: &secretmanagerpb.Replication_Automatic{},
+				},
+			},
+		},
+	})
+	if err != nil {
+		if status.Code(err) == codes.AlreadyExists {
+			// best-effort で full name を組み立てる (caller が再利用パスで
+			// AddVersion に渡せるよう)
+			return fmt.Sprintf("%s/secrets/%s", parent, shortName), true, nil
+		}
+		return "", false, err
+	}
+	return s.GetName(), false, nil
 }
 
 // iamLister は IAM Admin + Resource Manager の必要部分だけ切り出した interface。
@@ -431,6 +489,7 @@ func newMuxWith(
 	mux.Handle("/sa-disable", requireAPIKey(apiKey, handleSetSADisabled(iamL, true)))
 	mux.Handle("/sa-enable", requireAPIKey(apiKey, handleSetSADisabled(iamL, false)))
 	mux.Handle("/add-version", requireAPIKey(apiKey, handleAddSecretVersion(l, projectID)))
+	mux.Handle("/create-secret", requireAPIKey(apiKey, handleCreateSecret(l, projectID)))
 	return mux
 }
 
@@ -642,6 +701,136 @@ func handleAddSecretVersion(l secretLister, projectID string) http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(addVersionResponse{
 			Ok:         true,
+			NewVersion: newVersionName,
+		})
+	})
+}
+
+// handleCreateSecret は POST /create-secret のハンドラ。
+//
+// 新 secret を作成し (automatic replication)、続けて initial value を version 1
+// として投入する。`fail_if_exists=true` (default) で既存 name 衝突は 409。
+//
+// クエリ:
+//   - `name` (required): secret short name。`secretNamePattern` で validate
+//
+// header:
+//   - `X-Inventory-API-Key` (required): shared secret 認証
+//   - `X-Actor-Email` (optional): 実操作者 email。actor audit log 用
+//   - `X-Fail-If-Exists` (optional, default "true"):
+//       - "true"  → 既存 name 衝突で 409、AddVersion は呼ばない
+//       - "false" → 既存 secret を再利用して AddVersion を続行 (新 version)
+//
+// body:
+//
+//	{ "value": "<initial value>" }
+//
+// response:
+//
+//	200 { "ok": true, "name": "<n>", "created": true|false,
+//	      "new_version": "projects/.../secrets/<n>/versions/<id>" }
+//	400 invalid input
+//	409 secret already exists (fail_if_exists=true)
+//	502 upstream error
+//
+// 必要 IAM (Runtime SA):
+//   - `roles/secretmanager.secretCreator` (= secrets.create)
+//   - `roles/secretmanager.secretVersionAdder` (既存 /add-version 用、再利用)
+//   `secretmanager.admin` は付けない (= delete 不可、最小権限)。
+func handleCreateSecret(l secretLister, projectID string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		name := r.URL.Query().Get("name")
+		if name == "" {
+			http.Error(w, "missing name", http.StatusBadRequest)
+			return
+		}
+		if !secretNamePattern.MatchString(name) {
+			http.Error(w, "invalid name", http.StatusBadRequest)
+			return
+		}
+
+		actor := sanitizeLogValue(r.Header.Get("X-Actor-Email"))
+		target := sanitizeLogValue(name)
+
+		// X-Fail-If-Exists header の default = true (== 安全側)。明示的に
+		// "false" を渡したときだけ既存 secret 再利用パスに入る。
+		failIfExists := true
+		if v := r.Header.Get("X-Fail-If-Exists"); v != "" {
+			switch strings.ToLower(v) {
+			case "false", "0", "no":
+				failIfExists = false
+			case "true", "1", "yes":
+				failIfExists = true
+			default:
+				http.Error(w, "invalid X-Fail-If-Exists (use true|false)", http.StatusBadRequest)
+				return
+			}
+		}
+
+		// body 読み込み (add-version と同じ MaxBytesReader policy)
+		r.Body = http.MaxBytesReader(w, r.Body, maxSecretValueBytes+1024)
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "request body too large or unreadable", http.StatusBadRequest)
+			return
+		}
+		var req createSecretRequest
+		if err := json.Unmarshal(bodyBytes, &req); err != nil {
+			http.Error(w, "bad request body", http.StatusBadRequest)
+			return
+		}
+		if req.Value == "" {
+			http.Error(w, "value is required", http.StatusBadRequest)
+			return
+		}
+		if len(req.Value) > maxSecretValueBytes {
+			http.Error(w, "value too large", http.StatusBadRequest)
+			return
+		}
+
+		log.Printf("CREATE_SECRET requested actor=%q target=%q fail_if_exists=%v value_bytes=%d",
+			actor, target, failIfExists, len(req.Value))
+
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		defer cancel()
+
+		parent := fmt.Sprintf("projects/%s", projectID)
+
+		secretFullName, alreadyExists, err := l.CreateSecret(ctx, parent, name)
+		if err != nil {
+			log.Printf("CREATE_SECRET upstream failed actor=%q target=%q err=%v",
+				actor, target, err)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+		if alreadyExists && failIfExists {
+			log.Printf("CREATE_SECRET conflict actor=%q target=%q already exists",
+				actor, target)
+			http.Error(w, "secret already exists", http.StatusConflict)
+			return
+		}
+
+		// 続けて initial value を投入。既存 secret 再利用パスでもここを通す。
+		newVersionName, err := l.AddSecretVersion(ctx, secretFullName, []byte(req.Value))
+		if err != nil {
+			log.Printf("CREATE_SECRET add-version failed actor=%q target=%q err=%v",
+				actor, target, err)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+
+		log.Printf("CREATE_SECRET ok actor=%q target=%q created=%v new_version=%q",
+			actor, target, !alreadyExists, sanitizeLogValue(newVersionName))
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(createSecretResponse{
+			Ok:         true,
+			Name:       name,
+			Created:    !alreadyExists,
 			NewVersion: newVersionName,
 		})
 	})

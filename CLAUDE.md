@@ -52,6 +52,11 @@ PR テンプレートは `.github/pull_request_template.md` で `Refs` を強制
     付与範囲は project 全体 / per-secret どちらでも可。Phase B 時点では
     project 全体 grant を許容するが、rotate 対象 secret が固定化された時点で
     per-secret IAM に絞ることを検討する
+  - **(例外) `roles/secretmanager.secretCreator`**
+    — `/create-secret` endpoint 用 (= rotate-mcp 経由の new secret 自動
+    provisioning、ippoan/secrets-inventory#18 create_secret tool)。secret の
+    新規作成権限のみで delete / value 取得は付けない。secretVersionAdder と
+    組み合わせて「create + 初版 AddVersion」を 1 endpoint で完結させる
 - 親 repo Worker からの呼び出しは `X-Inventory-API-Key` header 経由の
   shared secret 認証 (constant-time 比較)
 - **write 系のうち以下のみ例外的に許可**。delete / create / role 変更 /
@@ -65,6 +70,14 @@ PR テンプレートは `.github/pull_request_template.md` で `Refs` を強制
     header で TOCTOU 検証可能 (= "rotate 直前の version が想定通りでなければ
     409 で reject"、UI ヒューマンエラー対策。strict consistency が必要な
     場合は別途 KV lock を被せる)
+  - **secret `create-secret` (`POST /create-secret`)** — 新規 secret を
+    automatic replication で作成し、続けて initial value を version 1 として
+    投入。`secretmanager.secretCreator` + `secretVersionAdder` の組み合わせで
+    動作 (= delete / value read 不可)。Body の `value` は同じく log /
+    response に echo しない。`X-Fail-If-Exists: true` (default) で既存 name
+    衝突は 409、`false` 明示で既存 secret 再利用 (= new version 投入)。
+    response の `created` boolean で 2 経路を識別できる。replication policy
+    は automatic 固定 (region 限定が必要になれば別 endpoint or query で拡張)
 
 ## 環境
 
