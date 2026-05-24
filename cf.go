@@ -108,8 +108,10 @@ func (c cfConfig) base() string {
 }
 
 // handleCfList は `GET /cf/secrets` のハンドラ。
-// Cloudflare API の list を per_page=1000 で 1 回叩いて全件返す (実運用の
-// secret 数は数十なので pagination 不要)。値そのものは API がそもそも返さない。
+// Cloudflare API の list を per_page=100 (CF Secrets Store の上限) で 1 回
+// 叩いて返す。実運用の secret 数は数十なので 100 で十分、pagination 不要。
+// `per_page=1000` は `invalid_per_page_parameter` (code 1001) で 400 になる。
+// 値そのものは API がそもそも返さない。
 func handleCfList(getter secretValueGetter, cfg cfConfig, http_ httpDoer) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -126,7 +128,7 @@ func handleCfList(getter secretValueGetter, cfg cfConfig, http_ httpDoer) http.H
 			return
 		}
 
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, cfg.base()+"?per_page=1000", nil)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, cfg.base()+"?per_page=100", nil)
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("User-Agent", "secrets-inventory-gcp")

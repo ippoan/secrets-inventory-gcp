@@ -34,7 +34,7 @@ func newGhTestMux(getter secretValueGetter, doer httpDoer) *http.ServeMux {
 
 func TestCfList_OK(t *testing.T) {
 	doer := &fakeHTTPDoer{}
-	doer.respond("GET https://api.cloudflare.com/client/v4/accounts/acc/secrets_store/stores/store/secrets?per_page=1000",
+	doer.respond("GET https://api.cloudflare.com/client/v4/accounts/acc/secrets_store/stores/store/secrets?per_page=100",
 		200, `{"success":true,"result":[{"id":"id-1","name":"FOO","scopes":["workers"],"status":"active","created":"2026-01-01T00:00:00Z","modified":"2026-05-01T00:00:00Z"}]}`)
 	getter := &fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}
 
@@ -72,7 +72,7 @@ func TestCfList_Unauthorized(t *testing.T) {
 
 func TestCfList_UpstreamFailure(t *testing.T) {
 	doer := &fakeHTTPDoer{}
-	doer.respond("GET https://api.cloudflare.com/client/v4/accounts/acc/secrets_store/stores/store/secrets?per_page=1000",
+	doer.respond("GET https://api.cloudflare.com/client/v4/accounts/acc/secrets_store/stores/store/secrets?per_page=100",
 		500, "internal")
 	getter := &fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}
 
