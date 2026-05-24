@@ -57,6 +57,13 @@ PR テンプレートは `.github/pull_request_template.md` で `Refs` を強制
     provisioning、ippoan/secrets-inventory#18 create_secret tool)。secret の
     新規作成権限のみで delete / value 取得は付けない。secretVersionAdder と
     組み合わせて「create + 初版 AddVersion」を 1 endpoint で完結させる
+  - **(例外) `roles/secretmanager.secretAccessor` を以下 2 secret 限定で**
+    — `/cf/*` `/gh/*` endpoint (= ippoan/secrets-inventory#45 で worker
+    から集約された CF / GitHub 経路) が CF API token と GitHub PAT を runtime
+    取得するため。**project 全体には付与しない**、`cf-secrets-inventory-
+    secrets-store-write` と `gh-secrets-inventory-org-secrets-write` の per-
+    secret IAM で `secretAccessor` を grant する。proxy 側は 5 分 TTL cache
+    して Secret Manager call を減らし、rotate 後の伝播 lag は最大 5 分
 - 親 repo Worker からの呼び出しは `X-Inventory-API-Key` header 経由の
   shared secret 認証 (constant-time 比較)
 - **write 系のうち以下のみ例外的に許可**。delete / create / role 変更 /
@@ -78,6 +85,21 @@ PR テンプレートは `.github/pull_request_template.md` で `Refs` を強制
     衝突は 409、`false` 明示で既存 secret 再利用 (= new version 投入)。
     response の `created` boolean で 2 経路を識別できる。replication policy
     は automatic 固定 (region 限定が必要になれば別 endpoint or query で拡張)
+  - **CF Secrets Store proxy (`/cf/secrets*`)** — ippoan/secrets-inventory#45
+    で worker の `CF_API_TOKEN` binding を本 proxy に集約したもの。
+    `GET /cf/secrets` (list)、`POST /cf/secrets` (create)、
+    `POST /cf/secrets/{id}` (rotate = PATCH 委譲)。値は body `value` field
+    のみ、log / response に echo しない。token は Secret Manager の
+    `cf-secrets-inventory-secrets-store-write` から runtime 取得
+    (5 分 TTL cache)。CF API は本 proxy 側で talking、worker は持たない
+  - **GitHub org secrets proxy (`/gh/secrets*`)** — 同 #45。
+    `GET /gh/secrets` (list)、`PUT /gh/secrets/{name}` (create/update)。
+    GitHub Actions org secret 必須の **libsodium sealed box encrypt
+    (Curve25519 + XSalsa20-Poly1305 + blake2b nonce) は proxy 側で実行**
+    し、worker は素の value を送る (= worker から libsodium 依存を排除)。
+    Go の `golang.org/x/crypto/nacl/box.SealAnonymous` を使用。PAT は
+    `gh-secrets-inventory-org-secrets-write` から runtime 取得 (5 分 TTL)。
+    `X-Fail-If-Exists: true` で事前 GET → 200 なら 409 reject
 
 ## 環境
 
@@ -171,6 +193,31 @@ cloud-run-deploy.yml` reusable で **AR remote-repo (pull-through cache)
   ```
   (= 値の追加のみ、delete / accessor は付与しない最小権限)
 
+  `/cf/*` `/gh/*` endpoint (= #45 worker 集約) を有効化する場合は CF API
+  token と GitHub PAT を Secret Manager に投入し、**per-secret IAM** で
+  `secretAccessor` を runtime SA に付与する (project 全体に拡張しないこと):
+  ```bash
+  # Secret 作成 + initial value 投入は user が手動 (= 値投入は人間 boundary)
+  echo -n "<CF API token (write)>" | gcloud secrets create \
+    cf-secrets-inventory-secrets-store-write \
+    --project=cloudsql-sv --replication-policy=automatic --data-file=-
+  echo -n "<GitHub PAT (write, classic or fine-grained)>" | gcloud secrets create \
+    gh-secrets-inventory-org-secrets-write \
+    --project=cloudsql-sv --replication-policy=automatic --data-file=-
+
+  # runtime SA に per-secret accessor grant
+  for SECRET in cf-secrets-inventory-secrets-store-write gh-secrets-inventory-org-secrets-write; do
+    gcloud secrets add-iam-policy-binding "$SECRET" \
+      --project=cloudsql-sv \
+      --member="serviceAccount:secrets-inventory-viewer@cloudsql-sv.iam.gserviceaccount.com" \
+      --role="roles/secretmanager.secretAccessor"
+  done
+  ```
+  CF token に必要な scope: `Account.Secrets Store:Edit` (read + write)。
+  GitHub PAT に必要な scope: `admin:org` (= org secrets write)。fine-grained
+  PAT なら `organization_secrets: read+write`。値は Secret Manager に置く
+  だけで、worker (`secrets-inventory`) からは見えない
+
 - **AR remote-repo**: `asia-northeast1-docker.pkg.dev/cloudsql-sv/ghcr/`
   (既存、daiun-salary 等と共有。`ippoan/secrets-inventory-gcp` という
   path で同 remote-repo に乗る)
@@ -200,9 +247,29 @@ gcloud run deploy secrets-inventory-gcp-staging \
   --service-account="$RUNTIME_SA" \
   --allow-unauthenticated \
   --ingress=all \
-  --set-env-vars="GCP_PROJECT_ID=$PROJECT_STAGING" \
+  --set-env-vars="GCP_PROJECT_ID=$PROJECT_STAGING,CF_ACCOUNT_ID=24b45709d060d957340180e995f0d373,CF_STORE_ID=bd7bc91a3e5f4111add4acf6cb4b8733,CF_TOKEN_SECRET_NAME=cf-secrets-inventory-secrets-store-write,GITHUB_ORG=ippoan,GH_TOKEN_SECRET_NAME=gh-secrets-inventory-org-secrets-write" \
   --update-secrets="INVENTORY_API_KEY=SECRETS_INVENTORY_GCP_PROXY_API_KEY_STAGING:latest"
 ```
+
+`CF_ACCOUNT_ID` / `CF_STORE_ID` / `GITHUB_ORG` は plain env var (= 親 repo
+の wrangler.jsonc と同値の constant)。`CF_TOKEN_SECRET_NAME` /
+`GH_TOKEN_SECRET_NAME` は Secret Manager 上の **secret short name** を
+plain env で渡し、proxy が runtime に AccessSecretVersion で値を取る (= 値
+そのものを Cloud Run env に焼かない設計)。
+
+**運用 setup と code deploy の分離**: 上記 5 つの env は proxy boot 時には
+optional 扱い (= 1 つでも空なら `/cf/*` `/gh/*` だけが 503 "endpoint not
+configured" を返す)。これにより:
+
+1. ci.yml の `set_env_vars` 更新前でも proxy の deploy が成功する (= boot
+   時に `mustEnv` が落とさない)
+2. Secret Manager への token 投入 + per-secret IAM grant + Cloud Run service
+   への env 注入は **user が運用 step として後追い**できる
+3. 既存 `/list-secrets` `/list-service-accounts` 等の read endpoint は env
+   未設定でも従来どおり動作する
+
+deploy 後、5 つの env を `gcloud run services update --set-env-vars ...` で
+注入した瞬間に `/cf/*` `/gh/*` が active 化する。
 
 これ以降は workflow が image を update する。
 

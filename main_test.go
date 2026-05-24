@@ -225,7 +225,7 @@ func TestTsToRFC3339(t *testing.T) {
 }
 
 func TestHealth(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "k")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "k")
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -238,7 +238,7 @@ func TestHealth(t *testing.T) {
 }
 
 func TestListSecretsRequiresAPIKey(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 
 	// no header
 	req := httptest.NewRequest(http.MethodGet, "/list-secrets", nil)
@@ -259,7 +259,7 @@ func TestListSecretsRequiresAPIKey(t *testing.T) {
 }
 
 func TestListSecretsRejectsNonGet(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodPost, "/list-secrets", nil)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	rec := httptest.NewRecorder()
@@ -282,7 +282,7 @@ func TestListSecretsOK(t *testing.T) {
 			"projects/p/secrets/A": rotA,
 		},
 	}
-	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 
 	req := httptest.NewRequest(http.MethodGet, "/list-secrets", nil)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
@@ -331,7 +331,7 @@ func TestListSecretsVersionFetchFailDegradesToEmpty(t *testing.T) {
 		},
 		versionErr: errors.New("simulated version API failure"),
 	}
-	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 
 	req := httptest.NewRequest(http.MethodGet, "/list-secrets", nil)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
@@ -357,7 +357,7 @@ func TestListSecretsVersionFetchFailDegradesToEmpty(t *testing.T) {
 }
 
 func TestListSecretsUpstreamError(t *testing.T) {
-	mux := newMuxWith(&fakeLister{err: errors.New("boom")}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{err: errors.New("boom")}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodGet, "/list-secrets", nil)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	rec := httptest.NewRecorder()
@@ -372,7 +372,7 @@ func TestListSecretsUpstreamError(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 func TestListServiceAccountsRequiresAPIKey(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodGet, "/list-service-accounts", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -382,7 +382,7 @@ func TestListServiceAccountsRequiresAPIKey(t *testing.T) {
 }
 
 func TestListServiceAccountsRejectsNonGet(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodPost, "/list-service-accounts", nil)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	rec := httptest.NewRecorder()
@@ -443,7 +443,7 @@ func TestListServiceAccountsOK(t *testing.T) {
 			},
 		},
 	}
-	mux := newMuxWith(&fakeLister{}, fakeIAM, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, fakeIAM, &fakeActivityLister{}, "p", "topsecret")
 
 	req := httptest.NewRequest(http.MethodGet, "/list-service-accounts", nil)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
@@ -517,7 +517,7 @@ func TestListServiceAccountsOK(t *testing.T) {
 }
 
 func TestListServiceAccountsUpstreamError(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{saErr: errors.New("boom")}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{saErr: errors.New("boom")}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodGet, "/list-service-accounts", nil)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	rec := httptest.NewRecorder()
@@ -533,7 +533,7 @@ func TestListServiceAccountsPolicyFailDegrades(t *testing.T) {
 		Name:  "projects/p/serviceAccounts/sa-x@p.iam.gserviceaccount.com",
 		Email: "sa-x@p.iam.gserviceaccount.com",
 	}
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{
 		sas:    []*adminpb.ServiceAccount{sa},
 		polErr: errors.New("simulated policy fetch failure"),
 	}, &fakeActivityLister{}, "p", "topsecret")
@@ -564,7 +564,7 @@ func TestListServiceAccountsKeysFailDegrades(t *testing.T) {
 		Email: "sa-b@p.iam.gserviceaccount.com",
 	}
 	keyT := timestamppb.New(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{
 		sas: []*adminpb.ServiceAccount{saA, saB},
 		keys: map[string][]*adminpb.ServiceAccountKey{
 			"projects/p/serviceAccounts/sa-b@p.iam.gserviceaccount.com": {
@@ -603,7 +603,7 @@ func TestListServiceAccountsAllKeysFailDegrades(t *testing.T) {
 		Name:  "projects/p/serviceAccounts/sa-x@p.iam.gserviceaccount.com",
 		Email: "sa-x@p.iam.gserviceaccount.com",
 	}
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{
 		sas:     []*adminpb.ServiceAccount{sa},
 		keysErr: errors.New("simulated global key fetch failure"),
 	}, &fakeActivityLister{}, "p", "topsecret")
@@ -785,7 +785,7 @@ func TestListServiceAccountsIncludesLastAuthenticatedAt(t *testing.T) {
 		Name:  "projects/p/serviceAccounts/sa-x@p.iam.gserviceaccount.com",
 		Email: "sa-x@p.iam.gserviceaccount.com",
 	}
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{
 		sas: []*adminpb.ServiceAccount{sa},
 	}, &fakeActivityLister{
 		lastAuth: map[string]string{
@@ -818,7 +818,7 @@ func TestListServiceAccountsActivityErrorDegradesGracefully(t *testing.T) {
 		Name:  "projects/p/serviceAccounts/sa-x@p.iam.gserviceaccount.com",
 		Email: "sa-x@p.iam.gserviceaccount.com",
 	}
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{
 		sas: []*adminpb.ServiceAccount{sa},
 	}, &fakeActivityLister{
 		err: errors.New("simulated policy analyzer permission denied"),
@@ -853,7 +853,7 @@ func TestListServiceAccountsMissingActivityForOneSA(t *testing.T) {
 		Name:  "projects/p/serviceAccounts/sa-b@p.iam.gserviceaccount.com",
 		Email: "sa-b@p.iam.gserviceaccount.com",
 	}
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{
 		sas: []*adminpb.ServiceAccount{saA, saB},
 	}, &fakeActivityLister{
 		lastAuth: map[string]string{
@@ -914,7 +914,7 @@ func TestSanitizeLogValue(t *testing.T) {
 
 func TestSaDisable(t *testing.T) {
 	fakeIAM := &fakeIAMLister{}
-	mux := newMuxWith(&fakeLister{}, fakeIAM, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, fakeIAM, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodPost, "/sa-disable?email=foo@p.iam.gserviceaccount.com", nil)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	req.Header.Set("X-Actor-Email", "actor@example.com")
@@ -940,7 +940,7 @@ func TestSaDisable(t *testing.T) {
 
 func TestSaEnable(t *testing.T) {
 	fakeIAM := &fakeIAMLister{}
-	mux := newMuxWith(&fakeLister{}, fakeIAM, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, fakeIAM, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodPost, "/sa-enable?email=bar@p.iam.gserviceaccount.com", nil)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	rec := httptest.NewRecorder()
@@ -954,7 +954,7 @@ func TestSaEnable(t *testing.T) {
 }
 
 func TestSaDisableRequiresAPIKey(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodPost, "/sa-disable?email=foo@p.iam.gserviceaccount.com", nil)
 	// no X-Inventory-API-Key
 	rec := httptest.NewRecorder()
@@ -965,7 +965,7 @@ func TestSaDisableRequiresAPIKey(t *testing.T) {
 }
 
 func TestSaDisableRejectsGET(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodGet, "/sa-disable?email=foo@p.iam.gserviceaccount.com", nil)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	rec := httptest.NewRecorder()
@@ -976,7 +976,7 @@ func TestSaDisableRejectsGET(t *testing.T) {
 }
 
 func TestSaDisableMissingEmail(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodPost, "/sa-disable", nil)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	rec := httptest.NewRecorder()
@@ -988,7 +988,7 @@ func TestSaDisableMissingEmail(t *testing.T) {
 
 func TestSaDisableUpstreamError(t *testing.T) {
 	fakeIAM := &fakeIAMLister{disableErr: errors.New("permission denied")}
-	mux := newMuxWith(&fakeLister{}, fakeIAM, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, fakeIAM, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodPost, "/sa-disable?email=foo@p.iam.gserviceaccount.com", nil)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	rec := httptest.NewRecorder()
@@ -1078,7 +1078,7 @@ func TestVersionIdPattern(t *testing.T) {
 }
 
 func TestAddVersionRequiresAPIKey(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", strings.NewReader(`{"value":"x"}`))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -1088,7 +1088,7 @@ func TestAddVersionRequiresAPIKey(t *testing.T) {
 }
 
 func TestAddVersionRejectsNonPOST(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodGet, "/add-version?name=FOO", nil)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	rec := httptest.NewRecorder()
@@ -1099,7 +1099,7 @@ func TestAddVersionRejectsNonPOST(t *testing.T) {
 }
 
 func TestAddVersionMissingName(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodPost, "/add-version", strings.NewReader(`{"value":"x"}`))
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	rec := httptest.NewRecorder()
@@ -1110,7 +1110,7 @@ func TestAddVersionMissingName(t *testing.T) {
 }
 
 func TestAddVersionInvalidName(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	for _, bad := range []string{"FOO/BAR", "FOO.BAR", "1FOO", "_X", strings.Repeat("x", 129)} {
 		t.Run(bad, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/add-version?name="+bad, strings.NewReader(`{"value":"x"}`))
@@ -1125,7 +1125,7 @@ func TestAddVersionInvalidName(t *testing.T) {
 }
 
 func TestAddVersionMalformedBody(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", strings.NewReader(`{not json`))
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	rec := httptest.NewRecorder()
@@ -1136,7 +1136,7 @@ func TestAddVersionMalformedBody(t *testing.T) {
 }
 
 func TestAddVersionMissingValue(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", strings.NewReader(`{}`))
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	rec := httptest.NewRecorder()
@@ -1147,7 +1147,7 @@ func TestAddVersionMissingValue(t *testing.T) {
 }
 
 func TestAddVersionValueTooLarge(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	// 65537 chars (1 byte over limit). JSON envelope を含めても MaxBytesReader
 	// 上限 (65536+1024) 内に収まる。
 	val := strings.Repeat("a", maxSecretValueBytes+1)
@@ -1164,7 +1164,7 @@ func TestAddVersionValueTooLarge(t *testing.T) {
 func TestAddVersionBodyExceedsMaxBytesReader(t *testing.T) {
 	// MaxBytesReader 上限 (maxSecretValueBytes + 1024) を超える body は
 	// io.ReadAll で error になり 400 で reject される (= memory pressure 防御)。
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	big := strings.Repeat("a", maxSecretValueBytes+2048)
 	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", strings.NewReader(big))
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
@@ -1181,7 +1181,7 @@ func TestAddVersionOK(t *testing.T) {
 			return secretName + "/versions/7"
 		},
 	}
-	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 
 	const secretValue = "super-secret-payload-do-not-log-me"
 	body, _ := json.Marshal(addVersionRequest{Value: secretValue})
@@ -1238,7 +1238,7 @@ func TestAddVersionOK(t *testing.T) {
 
 func TestAddVersionUpstreamError(t *testing.T) {
 	f := &fakeLister{addVersionErr: errors.New("PERMISSION_DENIED add version")}
-	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 
 	body, _ := json.Marshal(addVersionRequest{Value: "x"})
 	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", bytes.NewReader(body))
@@ -1266,7 +1266,7 @@ func TestAddVersionTOCTOUMatch(t *testing.T) {
 			return secretName + "/versions/4"
 		},
 	}
-	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 
 	body, _ := json.Marshal(addVersionRequest{Value: "x"})
 	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", bytes.NewReader(body))
@@ -1290,7 +1290,7 @@ func TestAddVersionTOCTOUMismatch(t *testing.T) {
 			"projects/p/secrets/FOO": "projects/p/secrets/FOO/versions/5",
 		},
 	}
-	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 
 	body, _ := json.Marshal(addVersionRequest{Value: "x"})
 	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", bytes.NewReader(body))
@@ -1310,7 +1310,7 @@ func TestAddVersionTOCTOUMismatch(t *testing.T) {
 func TestAddVersionTOCTOULatestError(t *testing.T) {
 	// LatestVersionName が error の場合は 502 で fail-closed
 	f := &fakeLister{latestNameErr: errors.New("rpc unavailable")}
-	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 
 	body, _ := json.Marshal(addVersionRequest{Value: "x"})
 	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", bytes.NewReader(body))
@@ -1338,7 +1338,7 @@ func TestAddVersionTOCTOUExpectedEmptyButLatestExists(t *testing.T) {
 			return secretName + "/versions/10"
 		},
 	}
-	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 
 	body, _ := json.Marshal(addVersionRequest{Value: "x"})
 	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", bytes.NewReader(body))
@@ -1361,7 +1361,7 @@ func TestAddVersionTOCTOUExpectedFirstVersion(t *testing.T) {
 	f := &fakeLister{
 		latestNames: map[string]string{}, // FOO は無し
 	}
-	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 
 	body, _ := json.Marshal(addVersionRequest{Value: "x"})
 	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", bytes.NewReader(body))
@@ -1380,7 +1380,7 @@ func TestAddVersionTOCTOUExpectedFirstVersion(t *testing.T) {
 
 func TestAddVersionInvalidExpectedVersionId(t *testing.T) {
 	// expected_version_id に injection 文字や長すぎる値が来た時は 400
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	for _, bad := range []string{"1.0", "1/2", "abc def", strings.Repeat("a", 33)} {
 		t.Run(bad, func(t *testing.T) {
 			body, _ := json.Marshal(addVersionRequest{Value: "x"})
@@ -1403,7 +1403,7 @@ func TestAddVersionResponseShape(t *testing.T) {
 			return secretName + "/versions/42"
 		},
 	}
-	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 
 	body, _ := json.Marshal(addVersionRequest{Value: "v"})
 	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", bytes.NewReader(body))
@@ -1422,7 +1422,7 @@ func TestAddVersionResponseShape(t *testing.T) {
 }
 
 func TestAddVersionEmptyBody(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", http.NoBody)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	rec := httptest.NewRecorder()
@@ -1442,7 +1442,7 @@ func TestAddVersionTOCTOULongActual(t *testing.T) {
 			"projects/p/secrets/FOO": long,
 		},
 	}
-	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 
 	body, _ := json.Marshal(addVersionRequest{Value: "x"})
 	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", bytes.NewReader(body))
@@ -1460,7 +1460,7 @@ func TestAddVersionTOCTOULongActual(t *testing.T) {
 // ------------------------------------------------------------
 
 func TestCreateSecretRequiresAPIKey(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=NEW", strings.NewReader(`{"value":"v"}`))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -1470,7 +1470,7 @@ func TestCreateSecretRequiresAPIKey(t *testing.T) {
 }
 
 func TestCreateSecretRejectsNonPOST(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodGet, "/create-secret?name=NEW", nil)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	rec := httptest.NewRecorder()
@@ -1481,7 +1481,7 @@ func TestCreateSecretRejectsNonPOST(t *testing.T) {
 }
 
 func TestCreateSecretMissingName(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodPost, "/create-secret", strings.NewReader(`{"value":"v"}`))
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	rec := httptest.NewRecorder()
@@ -1492,7 +1492,7 @@ func TestCreateSecretMissingName(t *testing.T) {
 }
 
 func TestCreateSecretInvalidName(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	for _, bad := range []string{"NEW/X", "1NEW", "_X", strings.Repeat("x", 129)} {
 		t.Run(bad, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/create-secret?name="+bad, strings.NewReader(`{"value":"v"}`))
@@ -1507,7 +1507,7 @@ func TestCreateSecretInvalidName(t *testing.T) {
 }
 
 func TestCreateSecretInvalidFailIfExists(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=NEW", strings.NewReader(`{"value":"v"}`))
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	req.Header.Set("X-Fail-If-Exists", "maybe")
@@ -1519,7 +1519,7 @@ func TestCreateSecretInvalidFailIfExists(t *testing.T) {
 }
 
 func TestCreateSecretMissingValue(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=NEW", strings.NewReader(`{}`))
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	rec := httptest.NewRecorder()
@@ -1530,7 +1530,7 @@ func TestCreateSecretMissingValue(t *testing.T) {
 }
 
 func TestCreateSecretMalformedBody(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=NEW", strings.NewReader(`{not json`))
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	rec := httptest.NewRecorder()
@@ -1541,7 +1541,7 @@ func TestCreateSecretMalformedBody(t *testing.T) {
 }
 
 func TestCreateSecretValueTooLarge(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	val := strings.Repeat("a", maxSecretValueBytes+1)
 	body, _ := json.Marshal(createSecretRequest{Value: val})
 	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=NEW", bytes.NewReader(body))
@@ -1554,7 +1554,7 @@ func TestCreateSecretValueTooLarge(t *testing.T) {
 }
 
 func TestCreateSecretBodyExceedsMaxBytesReader(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	big := strings.Repeat("a", maxSecretValueBytes+2048)
 	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=NEW", strings.NewReader(big))
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
@@ -1571,7 +1571,7 @@ func TestCreateSecretOK(t *testing.T) {
 			return secretName + "/versions/1"
 		},
 	}
-	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 
 	const secretValue = "secret-payload-do-not-log"
 	body, _ := json.Marshal(createSecretRequest{Value: secretValue})
@@ -1630,7 +1630,7 @@ func TestCreateSecretConflictWhenFailIfExistsDefault(t *testing.T) {
 	f := &fakeLister{
 		existingSecrets: map[string]bool{"EXISTING": true},
 	}
-	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	body, _ := json.Marshal(createSecretRequest{Value: "v"})
 	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=EXISTING", bytes.NewReader(body))
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
@@ -1652,7 +1652,7 @@ func TestCreateSecretReuseWhenFailIfExistsFalse(t *testing.T) {
 		existingSecrets:  map[string]bool{"EXISTING": true},
 		addVersionNameFn: func(secretName string) string { return secretName + "/versions/5" },
 	}
-	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	body, _ := json.Marshal(createSecretRequest{Value: "v"})
 	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=EXISTING", bytes.NewReader(body))
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
@@ -1678,7 +1678,7 @@ func TestCreateSecretReuseWhenFailIfExistsFalse(t *testing.T) {
 
 func TestCreateSecretUpstreamErrorOnCreate(t *testing.T) {
 	f := &fakeLister{createSecretErr: errors.New("PERMISSION_DENIED creator role missing")}
-	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	body, _ := json.Marshal(createSecretRequest{Value: "v"})
 	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=NEW", bytes.NewReader(body))
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
@@ -1697,7 +1697,7 @@ func TestCreateSecretUpstreamErrorOnCreate(t *testing.T) {
 func TestCreateSecretUpstreamErrorOnAddVersion(t *testing.T) {
 	// CreateSecret は成功するが AddVersion で失敗するシナリオ (= 502)
 	f := &fakeLister{addVersionErr: errors.New("quota exceeded")}
-	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	body, _ := json.Marshal(createSecretRequest{Value: "v"})
 	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=NEW", bytes.NewReader(body))
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
@@ -1730,7 +1730,7 @@ func TestCreateSecretFailIfExistsAcceptsAliases(t *testing.T) {
 				existingSecrets:  map[string]bool{"EXISTING": true},
 				addVersionNameFn: func(secretName string) string { return secretName + "/versions/2" },
 			}
-			mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+			mux := newMuxWithTest(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 			body, _ := json.Marshal(createSecretRequest{Value: "v"})
 			req := httptest.NewRequest(http.MethodPost, "/create-secret?name=EXISTING", bytes.NewReader(body))
 			req.Header.Set("X-Inventory-API-Key", "topsecret")
@@ -1745,7 +1745,7 @@ func TestCreateSecretFailIfExistsAcceptsAliases(t *testing.T) {
 }
 
 func TestCreateSecretEmptyBody(t *testing.T) {
-	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	mux := newMuxWithTest(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
 	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=NEW", http.NoBody)
 	req.Header.Set("X-Inventory-API-Key", "topsecret")
 	rec := httptest.NewRecorder()
