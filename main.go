@@ -508,8 +508,10 @@ var secretNamePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,127}$`)
 
 // versionIdPattern は GCP の version id (`1`, `2`, ... or `latest`) の最小
 // validate。TOCTOU 期待値として呼び出し側から渡される値が後段の log /
-// 比較で injection されないことを確認する。
-var versionIdPattern = regexp.MustCompile(`^[A-Za-z0-9]{1,32}$`)
+// 比較で injection されないことを確認する。GCP の Secret Manager version は
+// 1 始まりの int で `latest` は alias。それ以外 (例えば `v1` や `MOCK`) は
+// **不正値として 400** にする。
+var versionIdPattern = regexp.MustCompile(`^([1-9][0-9]{0,15}|latest)$`)
 
 // maxSecretValueBytes は POST /add-version の `value` 最大長 (= rotate-mcp
 // tool の inputSchema.new_value.maxLength と揃える)。GCP Secret Manager 自身は

@@ -1026,13 +1026,25 @@ func TestSecretNamePattern(t *testing.T) {
 }
 
 func TestVersionIdPattern(t *testing.T) {
-	ok := []string{"1", "12345", "latest", "MOCK"}
+	ok := []string{"1", "12345", "9999999999999999", "latest"}
 	for _, v := range ok {
 		if !versionIdPattern.MatchString(v) {
 			t.Errorf("%q should match", v)
 		}
 	}
-	bad := []string{"", "1.0", "1-2", "v1", strings.Repeat("a", 33)}
+	// "0" は GCP の version id 採番が 1 始まりなので不正、`MOCK` や `v1` の
+	// ように "latest" 以外のアルファベット混入も不正値として 400 にする。
+	bad := []string{
+		"",
+		"0",
+		"1.0",
+		"1-2",
+		"v1",
+		"MOCK",
+		"latest1",
+		strings.Repeat("a", 33),
+		strings.Repeat("9", 17), // 17 digit = `[1-9][0-9]{0,15}` の最大 16 桁を超え
+	}
 	for _, v := range bad {
 		if versionIdPattern.MatchString(v) {
 			t.Errorf("%q should NOT match", v)
