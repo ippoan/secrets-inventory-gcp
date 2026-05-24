@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -83,6 +85,22 @@ type listServiceAccountsResponse struct {
 	ServiceAccounts []serviceAccountItem `json:"service_accounts"`
 }
 
+// addVersionRequest は POST /add-version の body。`value` は **JSON body
+// のみで運ぶ** (query / header に出さない = log / proxy 中継箇所に値が漏れる
+// 経路を構造的に閉じる)。
+type addVersionRequest struct {
+	Value string `json:"value"`
+}
+
+// addVersionResponse は成功時の戻り値。`new_version` は GCP が割り当てた
+// full resource name (`projects/.../secrets/<n>/versions/<id>`)。
+//
+// **値 (Value) は絶対に echo しない**。response field にも存在しない。
+type addVersionResponse struct {
+	Ok         bool   `json:"ok"`
+	NewVersion string `json:"new_version"`
+}
+
 func main() {
 	projectID := mustEnv("GCP_PROJECT_ID")
 	apiKey := mustEnv("INVENTORY_API_KEY")
@@ -130,7 +148,7 @@ func main() {
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-log.Printf("secrets-inventory-gcp listening on :%s (project=%s)", port, projectID)
+	log.Printf("secrets-inventory-gcp listening on :%s (project=%s)", port, projectID)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server: %v", err)
 	}
@@ -146,11 +164,28 @@ func mustEnv(key string) string {
 
 // secretLister は *secretmanager.Client の必要部分だけを切り出した interface。
 // テストでは fake を差し込めるようにするための薄い境界。
+//
+// 基本は read-only だが、`AddSecretVersion` のみ例外的に write を許す
+// (= secrets-rotate-mcp 経由の rotation 用)。SA は
+// `roles/secretmanager.secretVersionAdder` を限定 grant する想定。
+// `roles/secretmanager.admin` は与えない (= delete / create-secret は
+// 引き続き禁止)。
 type secretLister interface {
 	ListSecrets(ctx context.Context, parent string) ([]*secretmanagerpb.Secret, error)
 	// LatestVersionCreateTime は親 secret (full name) の latest 1 version の
 	// create_time を返す。Version 0 件なら (nil, nil)。
 	LatestVersionCreateTime(ctx context.Context, secretName string) (*timestamppb.Timestamp, error)
+	// LatestVersionName は親 secret (full name) の latest 1 version の
+	// full name (`projects/.../secrets/<n>/versions/<id>`) を返す。
+	// Version 0 件なら ("", nil)。TOCTOU 検証で「rotate 直前の version が
+	// 想定通りか」を確認するのに使う。
+	LatestVersionName(ctx context.Context, secretName string) (string, error)
+	// AddSecretVersion は新しい version を投入する。返り値は GCP が
+	// 割り当てた full version name。`value` は呼び出し側 (handler) で
+	// **絶対に log しない / response に echo しない** ことを保証する。
+	// この interface 境界では []byte で受け、Secret Manager の
+	// SecretPayload.Data にそのまま渡す。
+	AddSecretVersion(ctx context.Context, secretName string, value []byte) (string, error)
 }
 
 type liveLister struct {
@@ -192,6 +227,40 @@ func (l *liveLister) LatestVersionCreateTime(ctx context.Context, secretName str
 		return nil, err
 	}
 	return v.GetCreateTime(), nil
+}
+
+// LatestVersionName は ListSecretVersions(PageSize=1) で最新 version の
+// full name を返す。Version が 0 件なら ("", nil) を返し、handler 側で
+// TOCTOU 期待値が空文字 (= 「まだ version 無いはず」) と比較する。
+func (l *liveLister) LatestVersionName(ctx context.Context, secretName string) (string, error) {
+	it := l.c.ListSecretVersions(ctx, &secretmanagerpb.ListSecretVersionsRequest{
+		Parent:   secretName,
+		PageSize: 1,
+	})
+	v, err := it.Next()
+	if errors.Is(err, iterator.Done) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return v.GetName(), nil
+}
+
+// AddSecretVersion は親 secret に payload を 1 version 投入し、新 version の
+// full name を返す。`value` は呼び出し側で log 禁止。エラーは upstream の
+// gRPC error をそのまま返し、handler 側で 502 にラップする。
+func (l *liveLister) AddSecretVersion(ctx context.Context, secretName string, value []byte) (string, error) {
+	v, err := l.c.AddSecretVersion(ctx, &secretmanagerpb.AddSecretVersionRequest{
+		Parent: secretName,
+		Payload: &secretmanagerpb.SecretPayload{
+			Data: value,
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	return v.GetName(), nil
 }
 
 // iamLister は IAM Admin + Resource Manager の必要部分だけ切り出した interface。
@@ -361,6 +430,7 @@ func newMuxWith(
 	mux.Handle("/list-service-accounts", requireAPIKey(apiKey, handleListServiceAccounts(iamL, actL, projectID)))
 	mux.Handle("/sa-disable", requireAPIKey(apiKey, handleSetSADisabled(iamL, true)))
 	mux.Handle("/sa-enable", requireAPIKey(apiKey, handleSetSADisabled(iamL, false)))
+	mux.Handle("/add-version", requireAPIKey(apiKey, handleAddSecretVersion(l, projectID)))
 	return mux
 }
 
@@ -425,6 +495,153 @@ func handleSetSADisabled(l iamLister, disabled bool) http.Handler {
 		log.Printf("SA %s ok actor=%q target=%q", action, actor, target)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+}
+
+// secretNamePattern は GCP Secret Manager の許す short name +
+// 親 repo (secrets-inventory) で実運用される命名 (SCREAMING_SNAKE と kebab
+// 両方) を許容する範囲に絞った正規表現。`/` 等 path injection 文字は不許可。
+// GCP 側の許可文字は [A-Za-z0-9_-] で長さ 1-255 だが、実運用上は 128 chars
+// 程度に制限して掛け違い予防。先頭は英字に強制する (GCP も英字 or _ を許容
+// するが '_' 始まりは可読性が低い)。
+var secretNamePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,127}$`)
+
+// versionIdPattern は GCP の version id (`1`, `2`, ... or `latest`) の最小
+// validate。TOCTOU 期待値として呼び出し側から渡される値が後段の log /
+// 比較で injection されないことを確認する。
+var versionIdPattern = regexp.MustCompile(`^[A-Za-z0-9]{1,32}$`)
+
+// maxSecretValueBytes は POST /add-version の `value` 最大長 (= rotate-mcp
+// tool の inputSchema.new_value.maxLength と揃える)。GCP Secret Manager 自身は
+// payload 64 KiB まで許容。
+const maxSecretValueBytes = 65536
+
+// handleAddSecretVersion は POST /add-version のハンドラ。
+//
+// 親 repo (secrets-rotate-mcp) から呼ばれ、GCP Secret Manager に新 version
+// を投入する。**値は JSON body の `value` field のみで受け取り**、
+// log にも response にも一切 echo しない。
+//
+// クエリ:
+//   - `name` (required): secret short name。`secretNamePattern` で validate
+//
+// header:
+//   - `X-Inventory-API-Key` (required): shared secret 認証 (`requireAPIKey` で)
+//   - `X-Actor-Email` (optional): 実操作者 email。actor audit log 用
+//   - `X-Expected-Version-Id` (optional): TOCTOU 検証。指定すると AddVersion
+//     直前に latest version id を確認し、不一致なら 409 で reject
+//
+// response:
+//
+//	200 { "ok": true, "new_version": "projects/.../secrets/<n>/versions/<id>" }
+//	400 invalid input
+//	401 unauthorized (上位 middleware)
+//	409 expected_version_id mismatch (TOCTOU)
+//	502 upstream GCP error
+//
+// 必要 IAM (Runtime SA, `secrets-inventory-viewer@...`):
+//   - `roles/secretmanager.secretVersionAdder` を **対象 project 全 secret に**
+//     付与する (rotate 対象 secret 範囲を絞りたい場合は per-secret IAM で限定)
+//   - `roles/secretmanager.admin` は付けない (= delete / create-secret は不可)
+func handleAddSecretVersion(l secretLister, projectID string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		name := r.URL.Query().Get("name")
+		if name == "" {
+			http.Error(w, "missing name", http.StatusBadRequest)
+			return
+		}
+		if !secretNamePattern.MatchString(name) {
+			http.Error(w, "invalid name", http.StatusBadRequest)
+			return
+		}
+
+		actor := sanitizeLogValue(r.Header.Get("X-Actor-Email"))
+		target := sanitizeLogValue(name)
+
+		expectedVersionId := r.Header.Get("X-Expected-Version-Id")
+		if expectedVersionId != "" && !versionIdPattern.MatchString(expectedVersionId) {
+			http.Error(w, "invalid expected_version_id", http.StatusBadRequest)
+			return
+		}
+
+		// body は 64KiB + 小さな JSON envelope slack 程度で打ち切る。
+		// それ以上はそもそも GCP 側でも reject されるが、proxy で先に打って
+		// memory pressure と log 汚染を抑える。
+		r.Body = http.MaxBytesReader(w, r.Body, maxSecretValueBytes+1024)
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "request body too large or unreadable", http.StatusBadRequest)
+			return
+		}
+		var req addVersionRequest
+		if err := json.Unmarshal(bodyBytes, &req); err != nil {
+			http.Error(w, "bad request body", http.StatusBadRequest)
+			return
+		}
+		if req.Value == "" {
+			http.Error(w, "value is required", http.StatusBadRequest)
+			return
+		}
+		if len(req.Value) > maxSecretValueBytes {
+			http.Error(w, "value too large", http.StatusBadRequest)
+			return
+		}
+
+		// 以後、`req.Value` は **絶対に log / error message / response に
+		// echo しない**。意図しない経路で出ないよう scope を狭めるため、
+		// ここで一度 []byte に変換して req は捨てる選択もあるが、Go の
+		// string は immutable で defensive copy 不要なので req のまま使う。
+
+		log.Printf("ADD_VERSION requested actor=%q target=%q expected_version=%q value_bytes=%d",
+			actor, target, sanitizeLogValue(expectedVersionId), len(req.Value))
+
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		defer cancel()
+
+		secretFullName := fmt.Sprintf("projects/%s/secrets/%s", projectID, name)
+
+		// TOCTOU 検証 (`expected_version_id` 指定時のみ)。
+		//
+		// SecretManager に native if-match は無いので「list latest → 比較
+		// → write」の best-effort check。比較〜write 間に他 client が
+		// version 追加した場合は検出できないが、UI ヒューマンエラー対策と
+		// しては十分。strict 一致が要件になった時は別途 KV lock を被せる。
+		if expectedVersionId != "" {
+			latest, err := l.LatestVersionName(ctx, secretFullName)
+			if err != nil {
+				log.Printf("ADD_VERSION list-latest failed actor=%q target=%q err=%v",
+					actor, target, err)
+				http.Error(w, "upstream error", http.StatusBadGateway)
+				return
+			}
+			actualVersionId := shortName(latest) // "" if no versions yet
+			if actualVersionId != expectedVersionId {
+				log.Printf("ADD_VERSION TOCTOU mismatch actor=%q target=%q expected=%q actual=%q",
+					actor, target, sanitizeLogValue(expectedVersionId), sanitizeLogValue(actualVersionId))
+				http.Error(w, "expected_version_id mismatch", http.StatusConflict)
+				return
+			}
+		}
+
+		newVersionName, err := l.AddSecretVersion(ctx, secretFullName, []byte(req.Value))
+		if err != nil {
+			log.Printf("ADD_VERSION upstream failed actor=%q target=%q err=%v",
+				actor, target, err)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+		log.Printf("ADD_VERSION ok actor=%q target=%q new_version=%q",
+			actor, target, sanitizeLogValue(newVersionName))
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(addVersionResponse{
+			Ok:         true,
+			NewVersion: newVersionName,
+		})
 	})
 }
 
