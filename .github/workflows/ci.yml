@@ -52,7 +52,8 @@ jobs:
     uses: ippoan/ci-workflows/.github/workflows/go-ci.yml@main
     permissions:
       contents: read
-      id-token: write   # nested `secret-verify` job が WIF OIDC token を mint するため
+      id-token: write       # nested `secret-verify` job が WIF OIDC token を mint するため
+      pull-requests: write  # nested `disable-auto-merge` job (= go-ci 側で defense in depth、Refs ci-workflows) が PR auto-merge を strip するため
     with:
       # GCP Secret Manager verify を **ci の直列後段** に組み込む。go-ci.yml
       # 側 (ci-workflows#38) で `secret-verify` job が `needs: [vet, test,
