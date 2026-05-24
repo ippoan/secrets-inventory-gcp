@@ -45,14 +45,26 @@ PR テンプレートは `.github/pull_request_template.md` で `Refs` を強制
   - **(例外) `iam.serviceAccounts.disable` + `.enable` のみ custom role で許可**
     — pause / 即時復元用途、reversible なので付与する (下記 write 例外を参照)。
     `accessor` (= 値の取得) や delete / create は付けない
+  - **(例外) `roles/secretmanager.secretVersionAdder`**
+    — `/add-version` endpoint 用 (= rotate-mcp 経由の secret rotation)。
+    既存 secret に新 version を投入する権限のみで、`secretmanager.admin` や
+    `secretmanager.secretAccessor` (= 値の取得) は引き続き付けない。
+    付与範囲は project 全体 / per-secret どちらでも可。Phase B 時点では
+    project 全体 grant を許容するが、rotate 対象 secret が固定化された時点で
+    per-secret IAM に絞ることを検討する
 - 親 repo Worker からの呼び出しは `X-Inventory-API-Key` header 経由の
   shared secret 認証 (constant-time 比較)
-- **write 系のうち SA の `disable` / `enable` のみ例外的に許可**。`delete`
-  / `create` / role 変更 / value 書き換えは引き続き禁止。disable は
-  reversible (= 即 enable で復元) なため操作コストが極めて低く、テスト・
-  即時復元用途専用と位置付ける。`POST /sa-disable?email=<sa>` / `/sa-enable`
-  で実装、`X-Actor-Email` header に実操作者 (CF Access JWT claim) を載せ、
-  proxy 側 application log で audit trail を残す
+- **write 系のうち以下のみ例外的に許可**。delete / create / role 変更 /
+  SA key 管理は引き続き禁止:
+  - SA `disable` / `enable` (`POST /sa-disable` / `/sa-enable`) — reversible、
+    テスト・即時復元用途。`X-Actor-Email` header で actor audit trail
+  - **secret `add-version` (`POST /add-version`)** — 既存 secret に新 version
+    を投入。`secretmanager.secretVersionAdder` のみで動作 (= delete /
+    create / value read 不可)。Body の `value` は **log / response に
+    一切 echo しない** (handler / test で固定)。`X-Expected-Version-Id`
+    header で TOCTOU 検証可能 (= "rotate 直前の version が想定通りでなければ
+    409 で reject"、UI ヒューマンエラー対策。strict consistency が必要な
+    場合は別途 KV lock を被せる)
 
 ## 環境
 
@@ -137,6 +149,14 @@ cloud-run-deploy.yml` reusable で **AR remote-repo (pull-through cache)
   `secrets-inventory-viewer@cloudsql-sv.iam.gserviceaccount.com` (既存、
   `roles/secretmanager.viewer` を持つことを確認。**JSON key は発行しない**
   = ADC 経由で取る)
+
+  rotate-mcp (= `POST /add-version`) を有効化する場合は追加で:
+  ```bash
+  gcloud projects add-iam-policy-binding cloudsql-sv \
+    --member="serviceAccount:secrets-inventory-viewer@cloudsql-sv.iam.gserviceaccount.com" \
+    --role="roles/secretmanager.secretVersionAdder"
+  ```
+  (= 値の追加のみ、delete / accessor は付与しない最小権限)
 
 - **AR remote-repo**: `asia-northeast1-docker.pkg.dev/cloudsql-sv/ghcr/`
   (既存、daiun-salary 等と共有。`ippoan/secrets-inventory-gcp` という
