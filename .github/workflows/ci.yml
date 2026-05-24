@@ -152,7 +152,15 @@ jobs:
       workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
       service_account: ${{ vars.GCP_WIF_SERVICE_ACCOUNT_STAGING }}
       runtime_service_account: secrets-inventory-viewer@cloudsql-sv.iam.gserviceaccount.com
-      set_env_vars: GCP_PROJECT_ID=${{ vars.GCP_PROJECT_ID_STAGING }}
+      # CF_* / GH_* / GITHUB_ORG は ippoan/secrets-inventory#45 で worker から
+      # 集約された `/cf/*` `/gh/*` endpoint の設定値。CF_ACCOUNT_ID / CF_STORE_ID
+      # は親 repo wrangler.jsonc と同値の constant、CF_TOKEN_SECRET_NAME /
+      # GH_TOKEN_SECRET_NAME は GCP Secret Manager 上の secret short name
+      # (= 値ではなく名前。proxy 側が runtime に AccessSecretVersion で値を取る)。
+      # 5 env のうち 1 つでも空のままなら main.go の requireCfConfigured /
+      # requireGhConfigured が 503 を返すので、Secret Manager 投入完了前でも
+      # deploy 自体は safe (CLAUDE.md "運用 setup と code deploy の分離" 節)。
+      set_env_vars: GCP_PROJECT_ID=${{ vars.GCP_PROJECT_ID_STAGING }},CF_ACCOUNT_ID=24b45709d060d957340180e995f0d373,CF_STORE_ID=bd7bc91a3e5f4111add4acf6cb4b8733,CF_TOKEN_SECRET_NAME=cf-secrets-inventory-secrets-store-write,GITHUB_ORG=ippoan,GH_TOKEN_SECRET_NAME=gh-secrets-inventory-org-secrets-write
       update_secrets: INVENTORY_API_KEY=SECRETS_INVENTORY_GCP_PROXY_API_KEY_STAGING:latest
 
   # 全 CI job (= ci / build-image / deploy-staging) が success した時だけ
