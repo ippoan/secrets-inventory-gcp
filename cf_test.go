@@ -1,0 +1,194 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+func newCfTestMux(getter secretValueGetter, doer httpDoer) *http.ServeMux {
+	return newMuxWith(
+		&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{},
+		getter,
+		cfConfig{accountID: "acc", storeID: "store", tokenSecret: "cf-token"},
+		ghConfig{org: "ippoan", tokenSecret: "gh-token"},
+		doer,
+		"p", "k",
+	)
+}
+
+func newGhTestMux(getter secretValueGetter, doer httpDoer) *http.ServeMux {
+	return newMuxWith(
+		&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{},
+		getter,
+		cfConfig{accountID: "acc", storeID: "store", tokenSecret: "cf-token"},
+		ghConfig{org: "ippoan", tokenSecret: "gh-token"},
+		doer,
+		"p", "k",
+	)
+}
+
+func TestCfList_OK(t *testing.T) {
+	doer := &fakeHTTPDoer{}
+	doer.respond("GET https://api.cloudflare.com/client/v4/accounts/acc/secrets_store/stores/store/secrets?per_page=1000",
+		200, `{"success":true,"result":[{"id":"id-1","name":"FOO","scopes":["workers"],"status":"active","created":"2026-01-01T00:00:00Z","modified":"2026-05-01T00:00:00Z"}]}`)
+	getter := &fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}
+
+	mux := newCfTestMux(getter, doer)
+	req := httptest.NewRequest(http.MethodGet, "/cf/secrets", nil)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp cfListResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Secrets) != 1 || resp.Secrets[0].Name != "FOO" || resp.Secrets[0].ID != "id-1" {
+		t.Errorf("unexpected: %+v", resp.Secrets)
+	}
+	// upstream req に Authorization Bearer が乗っているか
+	if got := doer.calls[0].Header.Get("Authorization"); got != "Bearer tok" {
+		t.Errorf("auth header = %q", got)
+	}
+}
+
+func TestCfList_Unauthorized(t *testing.T) {
+	mux := newCfTestMux(&fakeSecretValueGetter{}, &fakeHTTPDoer{})
+	req := httptest.NewRequest(http.MethodGet, "/cf/secrets", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", rec.Code)
+	}
+}
+
+func TestCfList_UpstreamFailure(t *testing.T) {
+	doer := &fakeHTTPDoer{}
+	doer.respond("GET https://api.cloudflare.com/client/v4/accounts/acc/secrets_store/stores/store/secrets?per_page=1000",
+		500, "internal")
+	getter := &fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}
+
+	mux := newCfTestMux(getter, doer)
+	req := httptest.NewRequest(http.MethodGet, "/cf/secrets", nil)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("expected 502, got %d", rec.Code)
+	}
+}
+
+func TestCfRotate_OK(t *testing.T) {
+	doer := &fakeHTTPDoer{}
+	doer.respond("PATCH https://api.cloudflare.com/client/v4/accounts/acc/secrets_store/stores/store/secrets/id-1",
+		200, `{"success":true,"result":{"id":"id-1"}}`)
+	getter := &fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}
+
+	mux := newCfTestMux(getter, doer)
+	body := bytes.NewBufferString(`{"value":"new-val"}`)
+	req := httptest.NewRequest(http.MethodPost, "/cf/secrets/id-1", body)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	// PATCH body に value が乗っているか + log/response に echo されていないか
+	patched := doer.calls[0]
+	patchedBody, _ := io.ReadAll(patched.Body)
+	if !strings.Contains(string(patchedBody), `"new-val"`) {
+		t.Errorf("PATCH body missing value: %s", patchedBody)
+	}
+	if strings.Contains(rec.Body.String(), "new-val") {
+		t.Error("response body should not echo the value")
+	}
+}
+
+func TestCfRotate_RejectInvalidID(t *testing.T) {
+	mux := newCfTestMux(&fakeSecretValueGetter{}, &fakeHTTPDoer{})
+	body := bytes.NewBufferString(`{"value":"x"}`)
+	req := httptest.NewRequest(http.MethodPost, "/cf/secrets/has%2Fslash", body)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", rec.Code)
+	}
+}
+
+func TestCfRotate_MissingValue(t *testing.T) {
+	mux := newCfTestMux(&fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}, &fakeHTTPDoer{})
+	body := bytes.NewBufferString(`{}`)
+	req := httptest.NewRequest(http.MethodPost, "/cf/secrets/id-1", body)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", rec.Code)
+	}
+}
+
+func TestCfCreate_OK(t *testing.T) {
+	doer := &fakeHTTPDoer{}
+	doer.respond("POST https://api.cloudflare.com/client/v4/accounts/acc/secrets_store/stores/store/secrets",
+		200, `{"success":true,"result":{"id":"new-id","name":"NEW_SECRET"}}`)
+	getter := &fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}
+
+	mux := newCfTestMux(getter, doer)
+	body := bytes.NewBufferString(`{"name":"NEW_SECRET","value":"v"}`)
+	req := httptest.NewRequest(http.MethodPost, "/cf/secrets", body)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp cfCreateResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.SecretID != "new-id" || resp.Name != "NEW_SECRET" {
+		t.Errorf("unexpected: %+v", resp)
+	}
+	// CF API は result が配列 (1 要素) で返ることもあるので両 shape を decode できる
+	if !strings.Contains(rec.Body.String(), `"NEW_SECRET"`) {
+		t.Errorf("response missing name")
+	}
+}
+
+func TestCfCreate_ArrayResultShape(t *testing.T) {
+	doer := &fakeHTTPDoer{}
+	doer.respond("POST https://api.cloudflare.com/client/v4/accounts/acc/secrets_store/stores/store/secrets",
+		200, `{"success":true,"result":[{"id":"arr-id","name":"X"}]}`)
+	getter := &fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}
+
+	mux := newCfTestMux(getter, doer)
+	body := bytes.NewBufferString(`{"name":"X","value":"v"}`)
+	req := httptest.NewRequest(http.MethodPost, "/cf/secrets", body)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCfCreate_RejectInvalidName(t *testing.T) {
+	mux := newCfTestMux(&fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}, &fakeHTTPDoer{})
+	body := bytes.NewBufferString(`{"name":"has spaces","value":"v"}`)
+	req := httptest.NewRequest(http.MethodPost, "/cf/secrets", body)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", rec.Code)
+	}
+}

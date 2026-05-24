@@ -123,6 +123,14 @@ type createSecretResponse struct {
 func main() {
 	projectID := mustEnv("GCP_PROJECT_ID")
 	apiKey := mustEnv("INVENTORY_API_KEY")
+	// CF / GH 関連 env は worker (`secrets-inventory`) の
+	// `CF_API_TOKEN` / `GITHUB_PAT` Secrets Store binding を本 proxy に集約
+	// するために必要。Refs ippoan/secrets-inventory#45.
+	cfAccountID := mustEnv("CF_ACCOUNT_ID")
+	cfStoreID := mustEnv("CF_STORE_ID")
+	cfTokenSecret := mustEnv("CF_TOKEN_SECRET_NAME")
+	ghOrg := mustEnv("GITHUB_ORG")
+	ghTokenSecret := mustEnv("GH_TOKEN_SECRET_NAME")
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -154,10 +162,22 @@ func main() {
 		log.Fatalf("policy analyzer service: %v", err)
 	}
 
+	// CF / GH endpoint 群で使う secret value getter。Secret Manager の
+	// AccessSecretVersion を 5 分 TTL で cache する (= rotate 伝播 lag は
+	// 最大 5 分許容)。
+	valueGetter := newCachedSecretValueGetter(
+		&liveSecretValueGetter{client: client, projectID: projectID},
+		5*time.Minute,
+	)
+
 	mux := newMuxWith(
 		&liveLister{c: client},
 		&liveIAMLister{iam: iamClient, crm: crmClient},
 		&livePolicyAnalyzer{svc: paService},
+		valueGetter,
+		cfConfig{accountID: cfAccountID, storeID: cfStoreID, tokenSecret: cfTokenSecret},
+		ghConfig{org: ghOrg, tokenSecret: ghTokenSecret},
+		http.DefaultClient,
 		projectID,
 		apiKey,
 	)
@@ -477,6 +497,10 @@ func newMuxWith(
 	l secretLister,
 	iamL iamLister,
 	actL saActivityLister,
+	valueGetter secretValueGetter,
+	cfCfg cfConfig,
+	ghCfg ghConfig,
+	httpClient httpDoer,
 	projectID, apiKey string,
 ) *http.ServeMux {
 	mux := http.NewServeMux()
@@ -490,7 +514,39 @@ func newMuxWith(
 	mux.Handle("/sa-enable", requireAPIKey(apiKey, handleSetSADisabled(iamL, false)))
 	mux.Handle("/add-version", requireAPIKey(apiKey, handleAddSecretVersion(l, projectID)))
 	mux.Handle("/create-secret", requireAPIKey(apiKey, handleCreateSecret(l, projectID)))
+	// CF Secrets Store proxy (Refs ippoan/secrets-inventory#45)
+	// `/cf/secrets` = list / create、`/cf/secrets/{id}` = rotate。
+	// ServeMux の prefix match で `/cf/secrets/` (trailing slash) を {id}
+	// 専用に流し、`/cf/secrets` (no slash) を list/create に分岐させる。
+	mux.Handle("/cf/secrets/", requireAPIKey(apiKey, handleCfRotate(valueGetter, cfCfg, httpClient)))
+	mux.Handle("/cf/secrets", requireAPIKey(apiKey, cfRootDispatcher(valueGetter, cfCfg, httpClient)))
+	// GitHub org secrets proxy
+	// `/gh/secrets/{name}` = PUT (= create/update)、`/gh/secrets` = GET list。
+	mux.Handle("/gh/secrets/", requireAPIKey(apiKey, handleGhPut(valueGetter, ghCfg, httpClient)))
+	mux.Handle("/gh/secrets", requireAPIKey(apiKey, handleGhList(valueGetter, ghCfg, httpClient)))
 	return mux
+}
+
+// cfRootDispatcher は `/cf/secrets` (trailing slash 無) を method 別に振り分け:
+//   - GET  → list
+//   - POST → create
+//
+// ServeMux 側で path 違いの handler を 2 つ登録する代わりに 1 つの handler 内
+// で method 切り替えしているのは、Go 1.22+ の `http.HandleFunc("GET /...")`
+// 構文を採用していない (compat 上 minimum) ためのワークアラウンド。
+func cfRootDispatcher(getter secretValueGetter, cfg cfConfig, http_ httpDoer) http.Handler {
+	listH := handleCfList(getter, cfg, http_)
+	createH := handleCfCreate(getter, cfg, http_)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			listH.ServeHTTP(w, r)
+		case http.MethodPost:
+			createH.ServeHTTP(w, r)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
 }
 
 func handleHealth(w http.ResponseWriter, _ *http.Request) {
