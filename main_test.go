@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -18,6 +20,8 @@ import (
 )
 
 type fakeLister struct {
+	mu sync.Mutex
+
 	secrets   []*secretmanagerpb.Secret
 	err       error
 	gotParent string
@@ -26,6 +30,23 @@ type fakeLister struct {
 	// `versionErr` が non-nil なら全 secret について error。
 	versionTimes map[string]*timestamppb.Timestamp
 	versionErr   error
+
+	// LatestVersionName の挙動。`latestNames[secretFullName]` を返し、
+	// `latestNameErr` non-nil なら error。空 string は version 0 件相当。
+	latestNames   map[string]string
+	latestNameErr error
+
+	// AddSecretVersion の挙動。`addedVersions` に呼び出しを記録、
+	// `addVersionErr` non-nil なら error、`addVersionNameFn` で返却 name を
+	// 計算 (default = `<secret>/versions/MOCK`)。
+	addedVersions    []addCall
+	addVersionErr    error
+	addVersionNameFn func(secretName string) string
+}
+
+type addCall struct {
+	secretName string
+	value      []byte
 }
 
 func (f *fakeLister) ListSecrets(_ context.Context, parent string) ([]*secretmanagerpb.Secret, error) {
@@ -41,6 +62,32 @@ func (f *fakeLister) LatestVersionCreateTime(_ context.Context, secretName strin
 		return nil, nil
 	}
 	return f.versionTimes[secretName], nil
+}
+
+func (f *fakeLister) LatestVersionName(_ context.Context, secretName string) (string, error) {
+	if f.latestNameErr != nil {
+		return "", f.latestNameErr
+	}
+	if f.latestNames == nil {
+		return "", nil
+	}
+	return f.latestNames[secretName], nil
+}
+
+func (f *fakeLister) AddSecretVersion(_ context.Context, secretName string, value []byte) (string, error) {
+	f.mu.Lock()
+	// value を defensive copy する (caller の slice mutate に巻き込まれない)
+	cp := make([]byte, len(value))
+	copy(cp, value)
+	f.addedVersions = append(f.addedVersions, addCall{secretName: secretName, value: cp})
+	f.mu.Unlock()
+	if f.addVersionErr != nil {
+		return "", f.addVersionErr
+	}
+	if f.addVersionNameFn != nil {
+		return f.addVersionNameFn(secretName), nil
+	}
+	return secretName + "/versions/MOCK", nil
 }
 
 // fakeActivityLister は saActivityLister の test 用 fake。`lastAuth` を
@@ -923,5 +970,450 @@ func TestSaDisableUpstreamError(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadGateway {
 		t.Errorf("status = %d, want 502", rec.Code)
+	}
+}
+
+// ------------------------------------------------------------
+// /add-version endpoint (= rotate-mcp が叩く)
+// ------------------------------------------------------------
+
+// captureLog は log.SetOutput を差し替えて test 内の log 出力を bytes.Buffer
+// に拾う。`value` の log leak 検出に使う。Cleanup で必ず元に戻す。
+func captureLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	buf := &bytes.Buffer{}
+	prev := log.Writer()
+	prevFlags := log.Flags()
+	log.SetOutput(buf)
+	t.Cleanup(func() {
+		log.SetOutput(prev)
+		log.SetFlags(prevFlags)
+	})
+	return buf
+}
+
+func TestSecretNamePattern(t *testing.T) {
+	ok := []string{
+		"FOO",
+		"foo",
+		"FOO_BAR",
+		"foo-bar",
+		"a",
+		"A1",
+		"some-secret-name",
+		"GH_SECRETS_INVENTORY_ORG_SECRETS_READ",
+		"cf-secrets-inventory-secrets-store-read",
+	}
+	for _, n := range ok {
+		if !secretNamePattern.MatchString(n) {
+			t.Errorf("%q should match", n)
+		}
+	}
+	bad := []string{
+		"",
+		"1FOO",                   // 先頭数字
+		"_FOO",                   // 先頭 underscore
+		"foo/bar",                // path injection
+		"foo.bar",                // dot 不許可
+		"foo bar",                // 空白
+		strings.Repeat("a", 129), // 長すぎ
+	}
+	for _, n := range bad {
+		if secretNamePattern.MatchString(n) {
+			t.Errorf("%q should NOT match", n)
+		}
+	}
+}
+
+func TestVersionIdPattern(t *testing.T) {
+	ok := []string{"1", "12345", "latest", "MOCK"}
+	for _, v := range ok {
+		if !versionIdPattern.MatchString(v) {
+			t.Errorf("%q should match", v)
+		}
+	}
+	bad := []string{"", "1.0", "1-2", "v1", strings.Repeat("a", 33)}
+	for _, v := range bad {
+		if versionIdPattern.MatchString(v) {
+			t.Errorf("%q should NOT match", v)
+		}
+	}
+}
+
+func TestAddVersionRequiresAPIKey(t *testing.T) {
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", strings.NewReader(`{"value":"x"}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestAddVersionRejectsNonPOST(t *testing.T) {
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	req := httptest.NewRequest(http.MethodGet, "/add-version?name=FOO", nil)
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", rec.Code)
+	}
+}
+
+func TestAddVersionMissingName(t *testing.T) {
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	req := httptest.NewRequest(http.MethodPost, "/add-version", strings.NewReader(`{"value":"x"}`))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestAddVersionInvalidName(t *testing.T) {
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	for _, bad := range []string{"FOO/BAR", "FOO.BAR", "1FOO", "_X", strings.Repeat("x", 129)} {
+		t.Run(bad, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/add-version?name="+bad, strings.NewReader(`{"value":"x"}`))
+			req.Header.Set("X-Inventory-API-Key", "topsecret")
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("name=%q status = %d, want 400", bad, rec.Code)
+			}
+		})
+	}
+}
+
+func TestAddVersionMalformedBody(t *testing.T) {
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", strings.NewReader(`{not json`))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestAddVersionMissingValue(t *testing.T) {
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", strings.NewReader(`{}`))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestAddVersionValueTooLarge(t *testing.T) {
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	// 65537 chars (1 byte over limit). JSON envelope を含めても MaxBytesReader
+	// 上限 (65536+1024) 内に収まる。
+	val := strings.Repeat("a", maxSecretValueBytes+1)
+	body, _ := json.Marshal(addVersionRequest{Value: val})
+	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", bytes.NewReader(body))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestAddVersionBodyExceedsMaxBytesReader(t *testing.T) {
+	// MaxBytesReader 上限 (maxSecretValueBytes + 1024) を超える body は
+	// io.ReadAll で error になり 400 で reject される (= memory pressure 防御)。
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	big := strings.Repeat("a", maxSecretValueBytes+2048)
+	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", strings.NewReader(big))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestAddVersionOK(t *testing.T) {
+	f := &fakeLister{
+		addVersionNameFn: func(secretName string) string {
+			return secretName + "/versions/7"
+		},
+	}
+	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+
+	const secretValue = "super-secret-payload-do-not-log-me"
+	body, _ := json.Marshal(addVersionRequest{Value: secretValue})
+	req := httptest.NewRequest(http.MethodPost, "/add-version?name=MY_SECRET", bytes.NewReader(body))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	req.Header.Set("X-Actor-Email", "actor@example.com")
+	rec := httptest.NewRecorder()
+
+	logBuf := captureLog(t)
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	var resp addVersionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !resp.Ok {
+		t.Errorf("ok = false")
+	}
+	if resp.NewVersion != "projects/p/secrets/MY_SECRET/versions/7" {
+		t.Errorf("new_version = %q", resp.NewVersion)
+	}
+
+	// fake が 1 回呼ばれていて、value が proxy に届いていること
+	if len(f.addedVersions) != 1 {
+		t.Fatalf("addedVersions len = %d", len(f.addedVersions))
+	}
+	got := f.addedVersions[0]
+	if got.secretName != "projects/p/secrets/MY_SECRET" {
+		t.Errorf("secretName = %q", got.secretName)
+	}
+	if string(got.value) != secretValue {
+		t.Errorf("value not forwarded as-is: %q", string(got.value))
+	}
+
+	// **値が response にも log にも出ていないこと** を固定 (= echo 禁止 spec)
+	if strings.Contains(rec.Body.String(), secretValue) {
+		t.Errorf("response leaked value: %s", rec.Body.String())
+	}
+	if strings.Contains(logBuf.String(), secretValue) {
+		t.Errorf("log leaked value: %s", logBuf.String())
+	}
+	// log には actor / target / value_bytes は出ていてよい
+	if !strings.Contains(logBuf.String(), "actor=\"actor@example.com\"") {
+		t.Errorf("log should contain actor email, got: %s", logBuf.String())
+	}
+	if !strings.Contains(logBuf.String(), "target=\"MY_SECRET\"") {
+		t.Errorf("log should contain target name, got: %s", logBuf.String())
+	}
+}
+
+func TestAddVersionUpstreamError(t *testing.T) {
+	f := &fakeLister{addVersionErr: errors.New("PERMISSION_DENIED add version")}
+	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+
+	body, _ := json.Marshal(addVersionRequest{Value: "x"})
+	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", bytes.NewReader(body))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", rec.Code)
+	}
+	// upstream error message は response body にそのまま出さない
+	// (502 ハンドラは generic "upstream error" を返す)
+	if strings.Contains(rec.Body.String(), "PERMISSION_DENIED") {
+		t.Errorf("response leaked upstream error: %s", rec.Body.String())
+	}
+}
+
+func TestAddVersionTOCTOUMatch(t *testing.T) {
+	// expected = actual の場合は write が走る
+	f := &fakeLister{
+		latestNames: map[string]string{
+			"projects/p/secrets/FOO": "projects/p/secrets/FOO/versions/3",
+		},
+		addVersionNameFn: func(secretName string) string {
+			return secretName + "/versions/4"
+		},
+	}
+	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+
+	body, _ := json.Marshal(addVersionRequest{Value: "x"})
+	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", bytes.NewReader(body))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	req.Header.Set("X-Expected-Version-Id", "3")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if len(f.addedVersions) != 1 {
+		t.Errorf("expected 1 add call after TOCTOU match, got %d", len(f.addedVersions))
+	}
+}
+
+func TestAddVersionTOCTOUMismatch(t *testing.T) {
+	// expected != actual の場合は write しない + 409 を返す
+	f := &fakeLister{
+		latestNames: map[string]string{
+			"projects/p/secrets/FOO": "projects/p/secrets/FOO/versions/5",
+		},
+	}
+	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+
+	body, _ := json.Marshal(addVersionRequest{Value: "x"})
+	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", bytes.NewReader(body))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	req.Header.Set("X-Expected-Version-Id", "3") // expected != actual (=5)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Errorf("status = %d, want 409", rec.Code)
+	}
+	if len(f.addedVersions) != 0 {
+		t.Errorf("expected 0 add calls on TOCTOU mismatch, got %d", len(f.addedVersions))
+	}
+}
+
+func TestAddVersionTOCTOULatestError(t *testing.T) {
+	// LatestVersionName が error の場合は 502 で fail-closed
+	f := &fakeLister{latestNameErr: errors.New("rpc unavailable")}
+	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+
+	body, _ := json.Marshal(addVersionRequest{Value: "x"})
+	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", bytes.NewReader(body))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	req.Header.Set("X-Expected-Version-Id", "3")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", rec.Code)
+	}
+	if len(f.addedVersions) != 0 {
+		t.Errorf("expected 0 add calls on latest-fetch error, got %d", len(f.addedVersions))
+	}
+}
+
+func TestAddVersionTOCTOUExpectedEmptyButLatestExists(t *testing.T) {
+	// 空 header (X-Expected-Version-Id 未送信) は expectedVersionId == "" となり
+	// TOCTOU 検証を skip する。
+	f := &fakeLister{
+		latestNames: map[string]string{
+			"projects/p/secrets/FOO": "projects/p/secrets/FOO/versions/9",
+		},
+		addVersionNameFn: func(secretName string) string {
+			return secretName + "/versions/10"
+		},
+	}
+	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+
+	body, _ := json.Marshal(addVersionRequest{Value: "x"})
+	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", bytes.NewReader(body))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	// X-Expected-Version-Id を全く付けない → TOCTOU 検証 skip、即 write
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 (no TOCTOU check)", rec.Code)
+	}
+	if len(f.addedVersions) != 1 {
+		t.Errorf("expected 1 add call, got %d", len(f.addedVersions))
+	}
+}
+
+func TestAddVersionTOCTOUExpectedFirstVersion(t *testing.T) {
+	// version 0 件の secret に expected_version_id="1" を投げる → mismatch (= 409)
+	// (= 「先に手動で 1 つ作っておく必要」ケースを安全側で防ぐ)
+	f := &fakeLister{
+		latestNames: map[string]string{}, // FOO は無し
+	}
+	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+
+	body, _ := json.Marshal(addVersionRequest{Value: "x"})
+	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", bytes.NewReader(body))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	req.Header.Set("X-Expected-Version-Id", "1")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Errorf("status = %d, want 409", rec.Code)
+	}
+	if len(f.addedVersions) != 0 {
+		t.Errorf("expected 0 add calls, got %d", len(f.addedVersions))
+	}
+}
+
+func TestAddVersionInvalidExpectedVersionId(t *testing.T) {
+	// expected_version_id に injection 文字や長すぎる値が来た時は 400
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	for _, bad := range []string{"1.0", "1/2", "abc def", strings.Repeat("a", 33)} {
+		t.Run(bad, func(t *testing.T) {
+			body, _ := json.Marshal(addVersionRequest{Value: "x"})
+			req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", bytes.NewReader(body))
+			req.Header.Set("X-Inventory-API-Key", "topsecret")
+			req.Header.Set("X-Expected-Version-Id", bad)
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("status = %d, want 400", rec.Code)
+			}
+		})
+	}
+}
+
+func TestAddVersionResponseShape(t *testing.T) {
+	// response body の JSON 形状を固定 (= caller の TS 型と一致)
+	f := &fakeLister{
+		addVersionNameFn: func(secretName string) string {
+			return secretName + "/versions/42"
+		},
+	}
+	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+
+	body, _ := json.Marshal(addVersionRequest{Value: "v"})
+	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", bytes.NewReader(body))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	bodyStr := strings.TrimSpace(rec.Body.String())
+	want := `{"ok":true,"new_version":"projects/p/secrets/FOO/versions/42"}`
+	if bodyStr != want {
+		t.Errorf("body shape mismatch:\ngot:  %s\nwant: %s", bodyStr, want)
+	}
+}
+
+func TestAddVersionEmptyBody(t *testing.T) {
+	mux := newMuxWith(&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", http.NoBody)
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	// json.Unmarshal of empty bytes returns "unexpected end of JSON input" => 400
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 (empty body)", rec.Code)
+	}
+}
+
+// Coverage: TOCTOU mismatch log line で sanitizeLogValue の truncate path を
+// exercise する (actual version name が 256 chars 超のとき)。
+func TestAddVersionTOCTOULongActual(t *testing.T) {
+	long := "projects/p/secrets/FOO/versions/" + strings.Repeat("z", 400)
+	f := &fakeLister{
+		latestNames: map[string]string{
+			"projects/p/secrets/FOO": long,
+		},
+	}
+	mux := newMuxWith(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+
+	body, _ := json.Marshal(addVersionRequest{Value: "x"})
+	req := httptest.NewRequest(http.MethodPost, "/add-version?name=FOO", bytes.NewReader(body))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	req.Header.Set("X-Expected-Version-Id", "1")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Errorf("status = %d, want 409", rec.Code)
 	}
 }
