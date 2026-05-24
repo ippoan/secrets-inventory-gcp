@@ -62,9 +62,15 @@ type ghPublicKey struct {
 }
 
 // ghConfig は GH endpoint 群が共有する設定。
+// 2 field が **すべて** non-empty なら configured。1 つでも空なら未設定扱いで
+// handler が 503 を返す (cf.go の cfConfig と同方針)。
 type ghConfig struct {
 	org         string
 	tokenSecret string
+}
+
+func (c ghConfig) configured() bool {
+	return c.org != "" && c.tokenSecret != ""
 }
 
 // ghNamePattern は GitHub Actions secret name の制約 (= `[A-Z_][A-Z0-9_]*`)

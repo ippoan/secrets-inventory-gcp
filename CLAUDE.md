@@ -257,6 +257,20 @@ gcloud run deploy secrets-inventory-gcp-staging \
 plain env で渡し、proxy が runtime に AccessSecretVersion で値を取る (= 値
 そのものを Cloud Run env に焼かない設計)。
 
+**運用 setup と code deploy の分離**: 上記 5 つの env は proxy boot 時には
+optional 扱い (= 1 つでも空なら `/cf/*` `/gh/*` だけが 503 "endpoint not
+configured" を返す)。これにより:
+
+1. ci.yml の `set_env_vars` 更新前でも proxy の deploy が成功する (= boot
+   時に `mustEnv` が落とさない)
+2. Secret Manager への token 投入 + per-secret IAM grant + Cloud Run service
+   への env 注入は **user が運用 step として後追い**できる
+3. 既存 `/list-secrets` `/list-service-accounts` 等の read endpoint は env
+   未設定でも従来どおり動作する
+
+deploy 後、5 つの env を `gcloud run services update --set-env-vars ...` で
+注入した瞬間に `/cf/*` `/gh/*` が active 化する。
+
 これ以降は workflow が image を update する。
 
 ### GitHub repo 側 (Settings → Secrets and variables → Actions)

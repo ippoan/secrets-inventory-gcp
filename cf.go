@@ -88,10 +88,17 @@ type cfCreateResponse struct {
 
 // cfConfig は CF endpoint 群が共有する設定。`accountID` / `storeID` は env
 // 由来の定数、`tokenSecret` は Secret Manager 上の token を指す short name。
+//
+// 3 field が **すべて** non-empty なら configured。1 つでも空なら未設定扱いで
+// handler が 503 を返す (= 運用 setup と code deploy を分離するため)。
 type cfConfig struct {
 	accountID   string
 	storeID     string
 	tokenSecret string
+}
+
+func (c cfConfig) configured() bool {
+	return c.accountID != "" && c.storeID != "" && c.tokenSecret != ""
 }
 
 // cfBase は `/accounts/{a}/secrets_store/stores/{s}/secrets` のベース URL を

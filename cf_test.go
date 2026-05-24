@@ -181,6 +181,50 @@ func TestCfCreate_ArrayResultShape(t *testing.T) {
 	}
 }
 
+func TestCf_NotConfigured_Returns503(t *testing.T) {
+	// cfCfg がすべて空 → 503 (= 運用 setup と code deploy を分離する degrade)
+	mux := newMuxWith(
+		&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{},
+		&fakeSecretValueGetter{},
+		cfConfig{}, // 未設定
+		ghConfig{org: "ippoan", tokenSecret: "gh-token"},
+		&fakeHTTPDoer{},
+		"p", "k",
+	)
+	for _, path := range []string{"/cf/secrets", "/cf/secrets/some-id"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("X-Inventory-API-Key", "k")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("path=%s expected 503, got %d body=%s", path, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "not configured") {
+			t.Errorf("path=%s expected 'not configured' message", path)
+		}
+	}
+}
+
+func TestGh_NotConfigured_Returns503(t *testing.T) {
+	mux := newMuxWith(
+		&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{},
+		&fakeSecretValueGetter{},
+		cfConfig{accountID: "a", storeID: "s", tokenSecret: "t"},
+		ghConfig{}, // 未設定
+		&fakeHTTPDoer{},
+		"p", "k",
+	)
+	for _, path := range []string{"/gh/secrets", "/gh/secrets/SOMETHING"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("X-Inventory-API-Key", "k")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("path=%s expected 503, got %d", path, rec.Code)
+		}
+	}
+}
+
 func TestCfCreate_RejectInvalidName(t *testing.T) {
 	mux := newCfTestMux(&fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}, &fakeHTTPDoer{})
 	body := bytes.NewBufferString(`{"name":"has spaces","value":"v"}`)

@@ -125,12 +125,18 @@ func main() {
 	apiKey := mustEnv("INVENTORY_API_KEY")
 	// CF / GH 関連 env は worker (`secrets-inventory`) の
 	// `CF_API_TOKEN` / `GITHUB_PAT` Secrets Store binding を本 proxy に集約
-	// するために必要。Refs ippoan/secrets-inventory#45.
-	cfAccountID := mustEnv("CF_ACCOUNT_ID")
-	cfStoreID := mustEnv("CF_STORE_ID")
-	cfTokenSecret := mustEnv("CF_TOKEN_SECRET_NAME")
-	ghOrg := mustEnv("GITHUB_ORG")
-	ghTokenSecret := mustEnv("GH_TOKEN_SECRET_NAME")
+	// するための optional 設定 (Refs ippoan/secrets-inventory#45)。
+	//
+	// **optional 扱い**: deploy workflow と Cloud Run service の env 更新は
+	// **コード deploy とは別の運用 step** (= Secret Manager に token 投入 +
+	// per-secret IAM grant が前提) で行うため、env 未設定でも proxy 自体は
+	// 起動する。未設定状態で `/cf/*` `/gh/*` を叩くと handler が 503 を返す
+	// (= "endpoint not configured")。
+	cfAccountID := os.Getenv("CF_ACCOUNT_ID")
+	cfStoreID := os.Getenv("CF_STORE_ID")
+	cfTokenSecret := os.Getenv("CF_TOKEN_SECRET_NAME")
+	ghOrg := os.Getenv("GITHUB_ORG")
+	ghTokenSecret := os.Getenv("GH_TOKEN_SECRET_NAME")
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -518,13 +524,43 @@ func newMuxWith(
 	// `/cf/secrets` = list / create、`/cf/secrets/{id}` = rotate。
 	// ServeMux の prefix match で `/cf/secrets/` (trailing slash) を {id}
 	// 専用に流し、`/cf/secrets` (no slash) を list/create に分岐させる。
-	mux.Handle("/cf/secrets/", requireAPIKey(apiKey, handleCfRotate(valueGetter, cfCfg, httpClient)))
-	mux.Handle("/cf/secrets", requireAPIKey(apiKey, cfRootDispatcher(valueGetter, cfCfg, httpClient)))
-	// GitHub org secrets proxy
-	// `/gh/secrets/{name}` = PUT (= create/update)、`/gh/secrets` = GET list。
-	mux.Handle("/gh/secrets/", requireAPIKey(apiKey, handleGhPut(valueGetter, ghCfg, httpClient)))
-	mux.Handle("/gh/secrets", requireAPIKey(apiKey, handleGhList(valueGetter, ghCfg, httpClient)))
+	// cfCfg / ghCfg が未設定 (= 必須 env 欠落) なら handler に届く前に 503 で
+	// 即返す。これにより Cloud Run service の env 更新を **コード deploy と
+	// 切り離して** 行える。
+	mux.Handle("/cf/secrets/", requireAPIKey(apiKey, requireCfConfigured(cfCfg,
+		handleCfRotate(valueGetter, cfCfg, httpClient))))
+	mux.Handle("/cf/secrets", requireAPIKey(apiKey, requireCfConfigured(cfCfg,
+		cfRootDispatcher(valueGetter, cfCfg, httpClient))))
+	mux.Handle("/gh/secrets/", requireAPIKey(apiKey, requireGhConfigured(ghCfg,
+		handleGhPut(valueGetter, ghCfg, httpClient))))
+	mux.Handle("/gh/secrets", requireAPIKey(apiKey, requireGhConfigured(ghCfg,
+		handleGhList(valueGetter, ghCfg, httpClient))))
 	return mux
+}
+
+// requireCfConfigured は cfConfig が未設定なら 503 を即返す guard。これにより
+// Cloud Run env 未投入の状態で deploy しても proxy 自体は up で、CF endpoint
+// だけが "not configured" を返す degrade pattern が成立する。
+func requireCfConfigured(cfg cfConfig, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !cfg.configured() {
+			http.Error(w, "endpoint not configured: missing CF_ACCOUNT_ID / CF_STORE_ID / CF_TOKEN_SECRET_NAME",
+				http.StatusServiceUnavailable)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func requireGhConfigured(cfg ghConfig, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !cfg.configured() {
+			http.Error(w, "endpoint not configured: missing GITHUB_ORG / GH_TOKEN_SECRET_NAME",
+				http.StatusServiceUnavailable)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // cfRootDispatcher は `/cf/secrets` (trailing slash 無) を method 別に振り分け:
