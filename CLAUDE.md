@@ -52,11 +52,16 @@ PR テンプレートは `.github/pull_request_template.md` で `Refs` を強制
     付与範囲は project 全体 / per-secret どちらでも可。Phase B 時点では
     project 全体 grant を許容するが、rotate 対象 secret が固定化された時点で
     per-secret IAM に絞ることを検討する
-  - **(例外) `roles/secretmanager.secretCreator`**
+  - **(例外) custom role `secretsInventoryCreator`** (`secretmanager.secrets.
+    create` permission のみ)
     — `/create-secret` endpoint 用 (= rotate-mcp 経由の new secret 自動
-    provisioning、ippoan/secrets-inventory#18 create_secret tool)。secret の
-    新規作成権限のみで delete / value 取得は付けない。secretVersionAdder と
-    組み合わせて「create + 初版 AddVersion」を 1 endpoint で完結させる
+    provisioning、ippoan/secrets-inventory#18 create_secret tool)。
+    **GCP の Secret Manager には `secretCreator` という predefined role は
+    存在しない** (`admin` / `secretAccessor` / `secretVersionAdder` /
+    `secretVersionManager` / `viewer` の 5 つのみ)。`admin` は delete /
+    setIamPolicy も含む過大権限なので避け、create だけを持つ単一権限の
+    custom role を切る。secretVersionAdder と組み合わせて「create + 初版
+    AddVersion」を 1 endpoint で完結させる (Refs #28)
   - **(例外) `roles/secretmanager.secretAccessor` を以下 2 secret 限定で**
     — `/cf/*` `/gh/*` endpoint (= ippoan/secrets-inventory#45 で worker
     から集約された CF / GitHub 経路) が CF API token と GitHub PAT を runtime
@@ -185,13 +190,38 @@ cloud-run-deploy.yml` reusable で **AR remote-repo (pull-through cache)
   `roles/secretmanager.viewer` を持つことを確認。**JSON key は発行しない**
   = ADC 経由で取る)
 
-  rotate-mcp (= `POST /add-version`) を有効化する場合は追加で:
+  rotate-mcp (= `POST /add-version`) + create-mcp (= `POST /create-secret`)
+  を有効化する場合は追加で:
   ```bash
+  SA="secrets-inventory-viewer@cloudsql-sv.iam.gserviceaccount.com"
+
+  # /add-version 用 (= secrets-inventory MCP の rotate_secret tool)
   gcloud projects add-iam-policy-binding cloudsql-sv \
-    --member="serviceAccount:secrets-inventory-viewer@cloudsql-sv.iam.gserviceaccount.com" \
+    --member="serviceAccount:$SA" \
     --role="roles/secretmanager.secretVersionAdder"
+
+  # /create-secret 用 (= secrets-inventory MCP の create_secret tool)
+  # GCP には secretCreator predefined role が存在しないので、create だけを
+  # 持つ custom role を 1 個切ってそれを bind する (admin は delete /
+  # setIamPolicy も含むので避ける)。
+  gcloud iam roles create secretsInventoryCreator \
+    --project=cloudsql-sv \
+    --title="Secrets Inventory Creator" \
+    --description="Create new Secret Manager secrets only (no delete, no value read)" \
+    --permissions=secretmanager.secrets.create \
+    --stage=GA
+
+  gcloud projects add-iam-policy-binding cloudsql-sv \
+    --member="serviceAccount:$SA" \
+    --role="projects/cloudsql-sv/roles/secretsInventoryCreator"
   ```
-  (= 値の追加のみ、delete / accessor は付与しない最小権限)
+  (= 値の追加 / 新規 secret 作成のみ、delete / accessor は付与しない最小権限)
+
+  > **必須 setup**: この 2 role の grant が漏れると `/add-version` /
+  > `/create-secret` が **gRPC PermissionDenied → handler が 502 にラップ**
+  > して返し、worker からは `gcp proxy 502: error code: 502` (= CF edge
+  > synthetic body) として観測される。read endpoint は viewer role だけで
+  > 動くため、write を実トラフィックに当てるまで露見しない (Refs #28)。
 
   `/cf/*` `/gh/*` endpoint (= #45 worker 集約) を有効化する場合は CF API
   token と GitHub PAT を Secret Manager に投入し、**per-secret IAM** で
