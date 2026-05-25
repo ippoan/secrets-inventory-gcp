@@ -52,11 +52,16 @@ PR テンプレートは `.github/pull_request_template.md` で `Refs` を強制
     付与範囲は project 全体 / per-secret どちらでも可。Phase B 時点では
     project 全体 grant を許容するが、rotate 対象 secret が固定化された時点で
     per-secret IAM に絞ることを検討する
-  - **(例外) `roles/secretmanager.secretCreator`**
+  - **(例外) custom role `secretsInventoryCreator`** (`secretmanager.secrets.
+    create` permission のみ)
     — `/create-secret` endpoint 用 (= rotate-mcp 経由の new secret 自動
-    provisioning、ippoan/secrets-inventory#18 create_secret tool)。secret の
-    新規作成権限のみで delete / value 取得は付けない。secretVersionAdder と
-    組み合わせて「create + 初版 AddVersion」を 1 endpoint で完結させる
+    provisioning、ippoan/secrets-inventory#18 create_secret tool)。
+    **GCP の Secret Manager には `secretCreator` という predefined role は
+    存在しない** (`admin` / `secretAccessor` / `secretVersionAdder` /
+    `secretVersionManager` / `viewer` の 5 つのみ)。`admin` は delete /
+    setIamPolicy も含む過大権限なので避け、create だけを持つ単一権限の
+    custom role を切る。secretVersionAdder と組み合わせて「create + 初版
+    AddVersion」を 1 endpoint で完結させる (Refs #28)
   - **(例外) `roles/secretmanager.secretAccessor` を以下 2 secret 限定で**
     — `/cf/*` `/gh/*` endpoint (= ippoan/secrets-inventory#45 で worker
     から集約された CF / GitHub 経路) が CF API token と GitHub PAT を runtime
@@ -196,10 +201,19 @@ cloud-run-deploy.yml` reusable で **AR remote-repo (pull-through cache)
     --role="roles/secretmanager.secretVersionAdder"
 
   # /create-secret 用 (= secrets-inventory MCP の create_secret tool)
-  # secretVersionAdder と組み合わせて create + 初版投入を 1 endpoint で完結
+  # GCP には secretCreator predefined role が存在しないので、create だけを
+  # 持つ custom role を 1 個切ってそれを bind する (admin は delete /
+  # setIamPolicy も含むので避ける)。
+  gcloud iam roles create secretsInventoryCreator \
+    --project=cloudsql-sv \
+    --title="Secrets Inventory Creator" \
+    --description="Create new Secret Manager secrets only (no delete, no value read)" \
+    --permissions=secretmanager.secrets.create \
+    --stage=GA
+
   gcloud projects add-iam-policy-binding cloudsql-sv \
     --member="serviceAccount:$SA" \
-    --role="roles/secretmanager.secretCreator"
+    --role="projects/cloudsql-sv/roles/secretsInventoryCreator"
   ```
   (= 値の追加 / 新規 secret 作成のみ、delete / accessor は付与しない最小権限)
 
