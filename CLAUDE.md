@@ -185,13 +185,29 @@ cloud-run-deploy.yml` reusable で **AR remote-repo (pull-through cache)
   `roles/secretmanager.viewer` を持つことを確認。**JSON key は発行しない**
   = ADC 経由で取る)
 
-  rotate-mcp (= `POST /add-version`) を有効化する場合は追加で:
+  rotate-mcp (= `POST /add-version`) + create-mcp (= `POST /create-secret`)
+  を有効化する場合は追加で:
   ```bash
+  SA="secrets-inventory-viewer@cloudsql-sv.iam.gserviceaccount.com"
+
+  # /add-version 用 (= secrets-inventory MCP の rotate_secret tool)
   gcloud projects add-iam-policy-binding cloudsql-sv \
-    --member="serviceAccount:secrets-inventory-viewer@cloudsql-sv.iam.gserviceaccount.com" \
+    --member="serviceAccount:$SA" \
     --role="roles/secretmanager.secretVersionAdder"
+
+  # /create-secret 用 (= secrets-inventory MCP の create_secret tool)
+  # secretVersionAdder と組み合わせて create + 初版投入を 1 endpoint で完結
+  gcloud projects add-iam-policy-binding cloudsql-sv \
+    --member="serviceAccount:$SA" \
+    --role="roles/secretmanager.secretCreator"
   ```
-  (= 値の追加のみ、delete / accessor は付与しない最小権限)
+  (= 値の追加 / 新規 secret 作成のみ、delete / accessor は付与しない最小権限)
+
+  > **必須 setup**: この 2 role の grant が漏れると `/add-version` /
+  > `/create-secret` が **gRPC PermissionDenied → handler が 502 にラップ**
+  > して返し、worker からは `gcp proxy 502: error code: 502` (= CF edge
+  > synthetic body) として観測される。read endpoint は viewer role だけで
+  > 動くため、write を実トラフィックに当てるまで露見しない (Refs #28)。
 
   `/cf/*` `/gh/*` endpoint (= #45 worker 集約) を有効化する場合は CF API
   token と GitHub PAT を Secret Manager に投入し、**per-secret IAM** で
