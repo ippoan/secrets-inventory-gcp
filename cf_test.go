@@ -181,6 +181,45 @@ func TestCfCreate_ArrayResultShape(t *testing.T) {
 	}
 }
 
+// CF Secrets Store API は POST body を `[{...}]` 形式の array で期待する仕様。
+// proxy がうっかり単体 object を送ると 400 になる (Refs #31)。assert で固定化。
+func TestCfCreate_PostsArrayBody(t *testing.T) {
+	doer := &fakeHTTPDoer{}
+	doer.respond("POST https://api.cloudflare.com/client/v4/accounts/acc/secrets_store/stores/store/secrets",
+		200, `{"success":true,"result":[{"id":"arr-id","name":"X"}]}`)
+	getter := &fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}
+
+	mux := newCfTestMux(getter, doer)
+	body := bytes.NewBufferString(`{"name":"X","value":"v","scopes":["workers"]}`)
+	req := httptest.NewRequest(http.MethodPost, "/cf/secrets", body)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(doer.calls) == 0 {
+		t.Fatal("no upstream call captured")
+	}
+	raw, err := io.ReadAll(doer.calls[0].Body)
+	if err != nil {
+		t.Fatalf("read upstream body: %v", err)
+	}
+	var arr []map[string]any
+	if err := json.Unmarshal(raw, &arr); err != nil {
+		t.Fatalf("upstream body is not a JSON array: %v\nbody=%s", err, raw)
+	}
+	if len(arr) != 1 {
+		t.Fatalf("expected single-element array, got %d", len(arr))
+	}
+	if arr[0]["name"] != "X" || arr[0]["value"] != "v" {
+		t.Errorf("unexpected fields: %+v", arr[0])
+	}
+	if scopes, _ := arr[0]["scopes"].([]any); len(scopes) != 1 || scopes[0] != "workers" {
+		t.Errorf("unexpected scopes: %+v", arr[0]["scopes"])
+	}
+}
+
 func TestCf_NotConfigured_Returns503(t *testing.T) {
 	// cfCfg がすべて空 → 503 (= 運用 setup と code deploy を分離する degrade)
 	mux := newMuxWith(

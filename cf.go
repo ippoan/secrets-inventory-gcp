@@ -343,11 +343,17 @@ func handleCfCreate(getter secretValueGetter, cfg cfConfig, http_ httpDoer) http
 		if len(scopes) == 0 {
 			scopes = []string{"workers"}
 		}
-		postBody, _ := json.Marshal(struct {
+		// CF Secrets Store API は POST body を **array of secret objects** で
+		// 期待する仕様 (https://developers.cloudflare.com/api/resources/
+		// secrets_store/subresources/stores/subresources/secrets/methods/create/)。
+		// 単体 object を送ると 400 "Bad Request" になる (Refs #31)。
+		// 本 proxy は 1 secret ずつしか create しないので 1 要素の array で
+		// 包む。scopes は worker 用 default `["workers"]`。
+		postBody, _ := json.Marshal([]struct {
 			Name   string   `json:"name"`
 			Value  string   `json:"value"`
 			Scopes []string `json:"scopes"`
-		}{Name: body.Name, Value: body.Value, Scopes: scopes})
+		}{{Name: body.Name, Value: body.Value, Scopes: scopes}})
 
 		req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
 			cfg.base(), strings.NewReader(string(postBody)))
