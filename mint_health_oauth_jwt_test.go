@@ -314,6 +314,7 @@ func TestMintHealthOAuthJwt_RoutedViaMux(t *testing.T) {
 		&fakeIAMLister{},
 		&fakeActivityLister{},
 		getter,
+		nil, // srcGetter (legacy test path → falls back to valueGetter)
 		cfConfig{}, ghConfig{},
 		http.DefaultClient,
 		"test-project",

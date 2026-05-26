@@ -52,6 +52,17 @@ PR テンプレートは `.github/pull_request_template.md` で `Refs` を強制
     付与範囲は project 全体 / per-secret どちらでも可。Phase B 時点では
     project 全体 grant を許容するが、rotate 対象 secret が固定化された時点で
     per-secret IAM に絞ることを検討する
+  - **(例外) custom role `secretsInventoryTempAccessor`** (`secretmanager.
+    secrets.getIamPolicy` + `.setIamPolicy` permission のみ)
+    — `/sync-from-gcp/:name` endpoint の source secret 読み出し用 (Refs #35)。
+    proxy が**自分自身に対して** TTL ≤ 10 分の **Condition 付き** `secretAccessor`
+    binding を `iam_temp_grant.go` 経由で grant → read → defer revoke する。
+    cleanup 失敗時も CEL Condition (`request.time < timestamp(...)`) で
+    auto-expire するため dead binding は時間で消える。
+    この role は **自分の SA への accessor binding 追加** のみが想定された用途で、
+    他 SA への grant や他 role の binding 追加は code path 上できない (TTL hard
+    cap + Role / Title / Member の hard-code、`iam_temp_grant.go` 参照)。
+    `setIamPolicy` という強い動詞権限を持つので CR で要重点 review。
   - **(例外) custom role `secretsInventoryCreator`** (`secretmanager.secrets.
     create` permission のみ)
     — `/create-secret` endpoint 用 (= rotate-mcp 経由の new secret 自動
@@ -214,8 +225,33 @@ cloud-run-deploy.yml` reusable で **AR remote-repo (pull-through cache)
   gcloud projects add-iam-policy-binding cloudsql-sv \
     --member="serviceAccount:$SA" \
     --role="projects/cloudsql-sv/roles/secretsInventoryCreator"
+
+  # /sync-from-gcp/:name 用 (= secrets-inventory MCP の sync 経路) — Refs #35
+  # 任意 source secret を CF / GitHub に伝播する endpoint で、source value を
+  # 読むために proxy が **自分自身に** TTL ≤ 10 分の Condition 付き
+  # secretAccessor binding を貼って read → 自動 revoke する。
+  # secretmanager.secrets.{get,set}IamPolicy のみを持つ custom role を切る
+  # (admin の他成分 = delete / direct value read は付与しない)。
+  gcloud iam roles create secretsInventoryTempAccessor \
+    --project=cloudsql-sv \
+    --title="Secrets Inventory Temp Accessor" \
+    --description="Manage IAM policy on Secret Manager secrets (used for short-lived self-grant from /sync-from-gcp; no delete, no direct value read)" \
+    --permissions=secretmanager.secrets.getIamPolicy,secretmanager.secrets.setIamPolicy \
+    --stage=GA
+
+  gcloud projects add-iam-policy-binding cloudsql-sv \
+    --member="serviceAccount:$SA" \
+    --role="projects/cloudsql-sv/roles/secretsInventoryTempAccessor"
   ```
-  (= 値の追加 / 新規 secret 作成のみ、delete / accessor は付与しない最小権限)
+  (= 値の追加 / 新規 secret 作成 / sync 時の TTL 付き self-grant、いずれも
+  delete / accessor の永続付与は含まない最小権限)
+
+  > **`secretsInventoryTempAccessor` を grant した結果**: operator が
+  > `/sync-from-gcp/:name` を呼ぶ前に source secret 単位の `secretAccessor`
+  > を gcloud で手動 grant する step は **不要** になる。proxy が
+  > `iam_temp_grant.go` 経由で grant → read → revoke を 1 リクエスト内で
+  > 完結させる。grant 失敗時 (= role 未付与等) は fallback して従来通り
+  > "operator pre-grant 必須" 動作にデグレード (log に明記)。
 
   > **必須 setup**: この 2 role の grant が漏れると `/add-version` /
   > `/create-secret` が **gRPC PermissionDenied → handler が 502 にラップ**

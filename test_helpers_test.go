@@ -14,6 +14,7 @@ func newMuxWithTest(
 	return newMuxWith(
 		l, iamL, actL,
 		&fakeSecretValueGetter{},
+		nil, // srcGetter unused in legacy tests; handler falls back to valueGetter
 		cfConfig{accountID: "test-account", storeID: "test-store", tokenSecret: "test-cf-token"},
 		ghConfig{org: "test-org", tokenSecret: "test-gh-token"},
 		&fakeHTTPDoer{},
