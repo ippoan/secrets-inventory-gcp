@@ -526,6 +526,12 @@ func newMuxWith(
 	// 値は proxy memory 内のみ、応答 body には echo しない。
 	mux.Handle("/mint-health-oauth-jwt", requireAPIKey(apiKey,
 		handleMintHealthOAuthJwt(valueGetter, l, projectID, nil)))
+	// Refs ippoan/auth-worker#209 PR4: 汎用 GCP→{CF, GitHub} sync endpoint。
+	// GCP に既存の secret 値を、CF Secrets Store / GitHub Actions org secret
+	// に同時 (or 個別) 投入する。値は proxy memory のみで取り回し、worker /
+	// response body に echo しない。target ごとに per-secret accessor IAM 必要。
+	mux.Handle("/sync-from-gcp/", requireAPIKey(apiKey,
+		handleSyncFromGcp(valueGetter, cfCfg, ghCfg, httpClient)))
 	// CF Secrets Store proxy (Refs ippoan/secrets-inventory#45)
 	// `/cf/secrets` = list / create、`/cf/secrets/{id}` = rotate。
 	// ServeMux の prefix match で `/cf/secrets/` (trailing slash) を {id}
