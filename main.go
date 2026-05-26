@@ -520,6 +520,12 @@ func newMuxWith(
 	mux.Handle("/sa-enable", requireAPIKey(apiKey, handleSetSADisabled(iamL, false)))
 	mux.Handle("/add-version", requireAPIKey(apiKey, handleAddSecretVersion(l, projectID)))
 	mux.Handle("/create-secret", requireAPIKey(apiKey, handleCreateSecret(l, projectID)))
+	// Refs ippoan/auth-worker#209: HEALTH_OAUTH_JWT mint endpoint.
+	// JWT_SECRET の値を AccessSecretVersion で取って HS256 sign し、
+	// HEALTH_OAUTH_JWT に新 version として書き込む 1 リクエスト endpoint。
+	// 値は proxy memory 内のみ、応答 body には echo しない。
+	mux.Handle("/mint-health-oauth-jwt", requireAPIKey(apiKey,
+		handleMintHealthOAuthJwt(valueGetter, l, projectID, nil)))
 	// CF Secrets Store proxy (Refs ippoan/secrets-inventory#45)
 	// `/cf/secrets` = list / create、`/cf/secrets/{id}` = rotate。
 	// ServeMux の prefix match で `/cf/secrets/` (trailing slash) を {id}
