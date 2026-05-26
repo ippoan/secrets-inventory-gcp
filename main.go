@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"cloud.google.com/go/compute/metadata"
 	iamadmin "cloud.google.com/go/iam/admin/apiv1"
 	"cloud.google.com/go/iam/admin/apiv1/adminpb"
 	iampb "cloud.google.com/go/iam/apiv1/iampb"
@@ -176,11 +177,38 @@ func main() {
 		5*time.Minute,
 	)
 
+	// sync-from-gcp の source secret read 用 reader を決める。
+	//   1) RUNTIME_SA_EMAIL env 明示
+	//   2) metadata server (`/computeMetadata/v1/instance/service-accounts/default/email`)
+	// どちらかで取れたら tempGrantManager を作って透過 wrap。取れなければ
+	// 従来通り直接 valueGetter (= operator が事前 gcloud grant 必須)。
+	// 取れた場合のみ runtime SA に custom role `secretsInventoryTempAccessor`
+	// (getIamPolicy + setIamPolicy) が必要 — CLAUDE.md 参照。
+	var srcGetter secretValueGetter = valueGetter
+	runtimeSA := resolveRuntimeSA(ctx)
+	if runtimeSA != "" {
+		mgr, err := newLiveTempGrantManager(
+			&liveSecretIAMPolicyClient{c: client},
+			valueGetter,
+			projectID, runtimeSA,
+			tempGrantMaxTTL, // 10 分 — secret value cache (5 分) より長め
+		)
+		if err != nil {
+			log.Printf("temp grant manager init failed (sync-from-gcp will require operator pre-grant): %v", err)
+		} else {
+			srcGetter = &grantingSrcReader{mgr: mgr}
+			log.Printf("sync-from-gcp source-read uses temp self-grant (sa=%s ttl=%v)", runtimeSA, tempGrantMaxTTL)
+		}
+	} else {
+		log.Printf("runtime SA email unresolved (no RUNTIME_SA_EMAIL env, metadata server unavailable); sync-from-gcp requires operator pre-grant per source secret")
+	}
+
 	mux := newMuxWith(
 		&liveLister{c: client},
 		&liveIAMLister{iam: iamClient, crm: crmClient},
 		&livePolicyAnalyzer{svc: paService},
 		valueGetter,
+		srcGetter,
 		cfConfig{accountID: cfAccountID, storeID: cfStoreID, tokenSecret: cfTokenSecret},
 		ghConfig{org: ghOrg, tokenSecret: ghTokenSecret},
 		http.DefaultClient,
@@ -197,6 +225,31 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server: %v", err)
 	}
+}
+
+// resolveRuntimeSA は proxy 自身が attached されている runtime SA email を
+// 解決する。優先順:
+//
+//  1. `RUNTIME_SA_EMAIL` env (= local dev / explicit override)
+//  2. GCE/Cloud Run metadata server (= 通常の Cloud Run 起動経路)
+//
+// どちらも失敗したら空文字を返す (= sync-from-gcp は temp grant 経路を使わず
+// 従来通り operator pre-grant 前提で動く degrade)。
+func resolveRuntimeSA(ctx context.Context) string {
+	if v := strings.TrimSpace(os.Getenv("RUNTIME_SA_EMAIL")); v != "" {
+		return v
+	}
+	if !metadata.OnGCE() {
+		return ""
+	}
+	mdCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	email, err := metadata.EmailWithContext(mdCtx, "default")
+	if err != nil {
+		log.Printf("metadata.Email default failed: %v", err)
+		return ""
+	}
+	return strings.TrimSpace(email)
 }
 
 func mustEnv(key string) string {
@@ -504,6 +557,7 @@ func newMuxWith(
 	iamL iamLister,
 	actL saActivityLister,
 	valueGetter secretValueGetter,
+	srcGetter secretValueGetter,
 	cfCfg cfConfig,
 	ghCfg ghConfig,
 	httpClient httpDoer,
@@ -531,7 +585,7 @@ func newMuxWith(
 	// に同時 (or 個別) 投入する。値は proxy memory のみで取り回し、worker /
 	// response body に echo しない。target ごとに per-secret accessor IAM 必要。
 	mux.Handle("/sync-from-gcp/", requireAPIKey(apiKey,
-		handleSyncFromGcp(valueGetter, cfCfg, ghCfg, httpClient)))
+		handleSyncFromGcp(valueGetter, srcGetter, cfCfg, ghCfg, httpClient)))
 	// CF Secrets Store proxy (Refs ippoan/secrets-inventory#45)
 	// `/cf/secrets` = list / create、`/cf/secrets/{id}` = rotate。
 	// ServeMux の prefix match で `/cf/secrets/` (trailing slash) を {id}

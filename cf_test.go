@@ -14,6 +14,7 @@ func newCfTestMux(getter secretValueGetter, doer httpDoer) *http.ServeMux {
 	return newMuxWith(
 		&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{},
 		getter,
+		nil, // srcGetter (legacy test path → falls back to valueGetter)
 		cfConfig{accountID: "acc", storeID: "store", tokenSecret: "cf-token"},
 		ghConfig{org: "ippoan", tokenSecret: "gh-token"},
 		doer,
@@ -25,6 +26,7 @@ func newGhTestMux(getter secretValueGetter, doer httpDoer) *http.ServeMux {
 	return newMuxWith(
 		&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{},
 		getter,
+		nil, // srcGetter (legacy test path → falls back to valueGetter)
 		cfConfig{accountID: "acc", storeID: "store", tokenSecret: "cf-token"},
 		ghConfig{org: "ippoan", tokenSecret: "gh-token"},
 		doer,
@@ -225,6 +227,7 @@ func TestCf_NotConfigured_Returns503(t *testing.T) {
 	mux := newMuxWith(
 		&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{},
 		&fakeSecretValueGetter{},
+		nil,        // srcGetter
 		cfConfig{}, // 未設定
 		ghConfig{org: "ippoan", tokenSecret: "gh-token"},
 		&fakeHTTPDoer{},
@@ -248,6 +251,7 @@ func TestGh_NotConfigured_Returns503(t *testing.T) {
 	mux := newMuxWith(
 		&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{},
 		&fakeSecretValueGetter{},
+		nil, // srcGetter
 		cfConfig{accountID: "a", storeID: "s", tokenSecret: "t"},
 		ghConfig{}, // 未設定
 		&fakeHTTPDoer{},

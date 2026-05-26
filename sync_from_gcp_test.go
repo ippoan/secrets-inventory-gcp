@@ -18,6 +18,7 @@ func newSyncTestMux(getter secretValueGetter, doer httpDoer) *http.ServeMux {
 	return newMuxWith(
 		&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{},
 		getter,
+		nil, // srcGetter; nil → handler falls back to getter (= legacy direct-read behavior)
 		cfConfig{accountID: "acc", storeID: "store", tokenSecret: "cf-token"},
 		ghConfig{org: "ippoan", tokenSecret: "gh-token"},
 		doer,
@@ -100,6 +101,7 @@ func TestSyncFromGcp_GhTargetButGhCfgMissing(t *testing.T) {
 	mux := newMuxWith(
 		&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{},
 		&fakeSecretValueGetter{},
+		nil, // srcGetter
 		cfConfig{accountID: "acc", storeID: "store", tokenSecret: "cf-token"},
 		ghConfig{}, // not configured
 		&fakeHTTPDoer{},
@@ -117,6 +119,7 @@ func TestSyncFromGcp_CfTargetButCfCfgMissing(t *testing.T) {
 	mux := newMuxWith(
 		&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{},
 		&fakeSecretValueGetter{},
+		nil, // srcGetter
 		cfConfig{}, // not configured
 		ghConfig{org: "ippoan", tokenSecret: "gh-token"},
 		&fakeHTTPDoer{},

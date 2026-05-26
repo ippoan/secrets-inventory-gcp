@@ -36,10 +36,16 @@ import (
 // POST or PATCH) 。重複 logic は putGhSecretWithValue / upsertCfSecretWithValue
 // が担う。
 //
-// 必要 IAM (operator step):
-//   - 各 source secret (= ここで sync する secret 名) について
-//     `roles/secretmanager.secretAccessor` を runtime SA に per-secret grant
-//   未 grant なら AccessSecretVersion で PermissionDenied → 502。
+// 必要 IAM (source secret read):
+//   - srcGetter が tempGrantManager 経由 (liveTempGrantManager) の場合、
+//     runtime SA は custom role `secretsInventoryTempAccessor`
+//     (getIamPolicy + setIamPolicy) を持てば足り、各 source secret 単位の
+//     accessor 事前 grant は **不要** (Refs #35)。temp grant が条件付きで
+//     accessor を自動付与する。
+//   - srcGetter が直接 secretValueGetter の場合 (= runtime SA email を
+//     proxy が解決できない fallback path)、従来通り operator が per-secret
+//     `roles/secretmanager.secretAccessor` を事前 grant する必要がある。
+//     未 grant なら AccessSecretVersion で PermissionDenied → 502。
 
 type syncTargetResult struct {
 	Status     string `json:"status"`              // "ok" | "fail"
@@ -55,12 +61,25 @@ type syncFromGcpResponse struct {
 	Results map[string]syncTargetResult `json:"results"`
 }
 
+// handleSyncFromGcp は sync handler を返す。
+//
+//   - getter:    CF / GH proxy token 等の **既に per-secret accessor が
+//                permanent grant 済の secret** を読む。propagateToGh/Cf 内で
+//                cfg.tokenSecret を取るのに使う。
+//   - srcGetter: 本 endpoint の **source secret** (= sync 対象) を読む。
+//                temp grant 経路 (grantingSrcReader) または直接 getter のどちらか。
+//                nil なら getter にフォールバックして従来挙動 (= operator が
+//                事前 gcloud grant した secret しか sync できない)。
 func handleSyncFromGcp(
 	getter secretValueGetter,
+	srcGetter secretValueGetter,
 	cfCfg cfConfig,
 	ghCfg ghConfig,
 	httpClient httpDoer,
 ) http.Handler {
+	if srcGetter == nil {
+		srcGetter = getter
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -163,8 +182,11 @@ func handleSyncFromGcp(
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
 
-		// 1. Read source value from GCP (per-secret accessor IAM 必要)
-		value, err := getter.Get(ctx, srcName)
+		// 1. Read source value from GCP。
+		// srcGetter が grantingSrcReader なら ここで自動的に conditional
+		// binding が add される (TTL ≤ 10 分、defer cleanup)。直接 getter
+		// なら従来通り永続 grant 前提で読む。
+		value, err := srcGetter.Get(ctx, srcName)
 		if err != nil {
 			log.Printf("SYNC_FROM_GCP source read failed actor=%q source=%q err=%v",
 				actor, source, err)
