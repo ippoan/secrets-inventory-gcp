@@ -586,6 +586,12 @@ func newMuxWith(
 	// response body に echo しない。target ごとに per-secret accessor IAM 必要。
 	mux.Handle("/sync-from-gcp/", requireAPIKey(apiKey,
 		handleSyncFromGcp(valueGetter, srcGetter, cfCfg, ghCfg, httpClient)))
+	// PKCS#1 → PKCS#8 変換 endpoint。GCP の RSA 秘密鍵 (PKCS#1) を読み、PKCS#8
+	// に変換して **別名 dst_name** で GCP に作成 (既存なら version-up)、任意で
+	// GitHub にも propagate。create-github-app-token@v2 (WebCrypto = PKCS#8 のみ)
+	// の "Invalid keyData" 対策。値は proxy 内で完結。Refs ippoan/secrets-inventory#59。
+	mux.Handle("/convert-pkcs8/", requireAPIKey(apiKey,
+		handleConvertPkcs8(l, srcGetter, valueGetter, ghCfg, httpClient, projectID)))
 	// CF Secrets Store proxy (Refs ippoan/secrets-inventory#45)
 	// `/cf/secrets` = list / create、`/cf/secrets/{id}` = rotate。
 	// ServeMux の prefix match で `/cf/secrets/` (trailing slash) を {id}
