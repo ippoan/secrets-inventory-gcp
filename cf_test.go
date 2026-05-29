@@ -268,6 +268,95 @@ func TestGh_NotConfigured_Returns503(t *testing.T) {
 	}
 }
 
+func TestCfServiceTokenList_OK(t *testing.T) {
+	doer := &fakeHTTPDoer{}
+	doer.respond("GET https://api.cloudflare.com/client/v4/accounts/acc/access/service_tokens?per_page=100",
+		200, `{"success":true,"result":[{"id":"st-1","name":"testone","client_id":"abc.access","duration":"8760h","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-05-01T00:00:00Z"}]}`)
+	getter := &fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}
+
+	mux := newCfTestMux(getter, doer)
+	req := httptest.NewRequest(http.MethodGet, "/cf/service-tokens", nil)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp cfServiceTokenListResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.ServiceTokens) != 1 {
+		t.Fatalf("expected 1 token, got %d", len(resp.ServiceTokens))
+	}
+	st := resp.ServiceTokens[0]
+	if st.ID != "st-1" || st.Name != "testone" || st.ClientID != "abc.access" {
+		t.Errorf("unexpected token: %+v", st)
+	}
+	// CF の created_at / updated_at が created / modified に正規化されているか
+	if st.Created != "2026-01-01T00:00:00Z" || st.Modified != "2026-05-01T00:00:00Z" {
+		t.Errorf("timestamps not normalized: %+v", st)
+	}
+	// upstream に Authorization Bearer が乗っているか
+	if got := doer.calls[0].Header.Get("Authorization"); got != "Bearer tok" {
+		t.Errorf("auth header = %q", got)
+	}
+	// client_secret は list では返らない (= 値非漏洩) — response に出ていないこと
+	if strings.Contains(rec.Body.String(), "client_secret") {
+		t.Error("response must not contain client_secret")
+	}
+}
+
+func TestCfServiceTokenList_Unauthorized(t *testing.T) {
+	mux := newCfTestMux(&fakeSecretValueGetter{}, &fakeHTTPDoer{})
+	req := httptest.NewRequest(http.MethodGet, "/cf/service-tokens", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", rec.Code)
+	}
+}
+
+func TestCfServiceTokenList_EnvelopeFailure(t *testing.T) {
+	doer := &fakeHTTPDoer{}
+	doer.respond("GET https://api.cloudflare.com/client/v4/accounts/acc/access/service_tokens?per_page=100",
+		200, `{"success":false,"errors":[{"code":1001,"message":"boom"}]}`)
+	getter := &fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}
+
+	mux := newCfTestMux(getter, doer)
+	req := httptest.NewRequest(http.MethodGet, "/cf/service-tokens", nil)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("expected 502, got %d", rec.Code)
+	}
+}
+
+func TestCfServiceTokenList_TokenFetchFailure(t *testing.T) {
+	// getter に cf-token が無い → token fetch 失敗 → 502
+	mux := newCfTestMux(&fakeSecretValueGetter{values: map[string]string{}}, &fakeHTTPDoer{})
+	req := httptest.NewRequest(http.MethodGet, "/cf/service-tokens", nil)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("expected 502, got %d", rec.Code)
+	}
+}
+
+func TestCfServiceTokenList_MethodNotAllowed(t *testing.T) {
+	mux := newCfTestMux(&fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}, &fakeHTTPDoer{})
+	req := httptest.NewRequest(http.MethodPost, "/cf/service-tokens", nil)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405, got %d", rec.Code)
+	}
+}
+
 func TestCfCreate_RejectInvalidName(t *testing.T) {
 	mux := newCfTestMux(&fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}, &fakeHTTPDoer{})
 	body := bytes.NewBufferString(`{"name":"has spaces","value":"v"}`)

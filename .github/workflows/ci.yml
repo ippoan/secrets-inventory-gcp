@@ -188,6 +188,11 @@ jobs:
       (needs.build-image.result == 'success' || needs.build-image.result == 'skipped') &&
       (needs.deploy-staging.result == 'success' || needs.deploy-staging.result == 'skipped')
     uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
+    # auto-merge.yml は ci-workflows#65 で github.token fallback を廃止し、
+    # GitHub App credential (CI_APP_ID / CI_APP_PRIVATE_KEY) を必須化した。
+    # caller から secrets: inherit で渡さないと "missing GitHub App
+    # credentials" で即 fail する (= Auto Merge job だけ赤くなる)。
+    secrets: inherit
     permissions:
       contents: write
       pull-requests: write
