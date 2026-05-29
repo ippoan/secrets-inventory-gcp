@@ -429,7 +429,22 @@ type cfServiceTokenRotateResponse struct {
 type cfServiceTokenDeleteResponse struct {
 	Ok      bool   `json:"ok"`
 	TokenID string `json:"token_id"`
+	// SmSecretName / LabelApplied は delete request に `sm_secret_name` query が
+	// 渡された時だけ意味を持つ。LabelApplied は対象 SM secret に
+	// `cf_service_token=deleted` audit label を打てたか (= revoke は成功した
+	// が label patch が失敗した場合は false で返り、CF revoke 自体は ok)。
+	SmSecretName string `json:"sm_secret_name,omitempty"`
+	LabelApplied bool   `json:"label_applied,omitempty"`
 }
+
+// cfServiceTokenDeletedLabel は delete 時に SM secret (client_secret 保管先) へ
+// 打つ audit label。台帳キー (`cf_token_id`) とは別に「この client_secret に
+// 対応する CF service token は revoke 済み」を記録する。GCP label の制約
+// (key/value とも lowercase 英数 + `_` `-`、63 文字以内、key 先頭は英字) を満たす。
+const (
+	cfServiceTokenDeletedLabelKey = "cf_service_token"
+	cfServiceTokenDeletedLabelVal = "deleted"
+)
 
 // handleCfServiceTokenRotate は `POST /cf/service-tokens/{id}/rotate` のハンドラ。
 //
@@ -565,9 +580,16 @@ func handleCfServiceTokenRotate(getter secretValueGetter, cfg cfConfig, http_ ht
 }
 
 // handleCfServiceTokenDelete は `DELETE /cf/service-tokens/{id}` のハンドラ。
-// CF の `DELETE /accounts/{a}/access/service_tokens/{id}` を pass-through する
-// (= 野良 token の revoke)。値・SM 連携なし。
-func handleCfServiceTokenDelete(getter secretValueGetter, cfg cfConfig, http_ httpDoer) http.Handler {
+// CF の `DELETE /accounts/{a}/access/service_tokens/{id}` を pass-through して
+// 野良 token を revoke する。
+//
+// 任意 query `?sm_secret_name=<short>` を渡すと、revoke 成功後にその
+// client_secret 保管 SM secret へ `cf_service_token=deleted` audit label を
+// 打つ (= 台帳が空でも明示渡しで対象 secret を特定できる経路、Refs #68)。
+// label patch は `secretsInventoryLabeler` 権限が要り、失敗しても CF revoke は
+// 既に成立しているので fatal にせず response の `label_applied=false` で返す。
+// 値 (client_secret) には触れない (= label メタデータのみ操作)。
+func handleCfServiceTokenDelete(getter secretValueGetter, cfg cfConfig, http_ httpDoer, l secretLister, projectID string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodDelete {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -583,9 +605,19 @@ func handleCfServiceTokenDelete(getter secretValueGetter, cfg cfConfig, http_ ht
 			return
 		}
 
+		// optional sm_secret_name は CF revoke を打つ前に format 検証して、
+		// 不正なら revoke せず 400 で返す (= revoke 成立後に 400 を返して
+		// 副作用と応答が食い違う事故を防ぐ)。
+		smName := r.URL.Query().Get("sm_secret_name")
+		if smName != "" && !secretNamePattern.MatchString(smName) {
+			http.Error(w, "invalid sm_secret_name", http.StatusBadRequest)
+			return
+		}
+
 		actor := sanitizeLogValue(r.Header.Get("X-Actor-Email"))
 		target := sanitizeLogValue(id)
-		log.Printf("CF_SVCTOKEN_DELETE requested actor=%q token_id=%q", actor, target)
+		log.Printf("CF_SVCTOKEN_DELETE requested actor=%q token_id=%q sm_secret_name=%q",
+			actor, target, sanitizeLogValue(smName))
 
 		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 		defer cancel()
@@ -624,9 +656,30 @@ func handleCfServiceTokenDelete(getter secretValueGetter, cfg cfConfig, http_ ht
 			return
 		}
 
-		log.Printf("CF_SVCTOKEN_DELETE ok actor=%q token_id=%q", actor, target)
+		// revoke 成立後に audit label を打つ (best-effort)。失敗しても CF token
+		// は既に revoke 済みなので 200 を返し、label_applied=false で伝える。
+		labelApplied := false
+		if smName != "" {
+			secretFullName := fmt.Sprintf("projects/%s/secrets/%s", projectID, smName)
+			if err := l.UpdateSecretLabels(ctx, secretFullName,
+				map[string]string{cfServiceTokenDeletedLabelKey: cfServiceTokenDeletedLabelVal}); err != nil {
+				log.Printf("CF_SVCTOKEN_DELETE label patch failed token_id=%q sm=%q err=%v",
+					target, sanitizeLogValue(smName), err)
+			} else {
+				labelApplied = true
+				log.Printf("CF_SVCTOKEN_DELETE label applied token_id=%q sm=%q %s=%s",
+					target, sanitizeLogValue(smName), cfServiceTokenDeletedLabelKey, cfServiceTokenDeletedLabelVal)
+			}
+		}
+
+		log.Printf("CF_SVCTOKEN_DELETE ok actor=%q token_id=%q label_applied=%v", actor, target, labelApplied)
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(cfServiceTokenDeleteResponse{Ok: true, TokenID: id})
+		_ = json.NewEncoder(w).Encode(cfServiceTokenDeleteResponse{
+			Ok:           true,
+			TokenID:      id,
+			SmSecretName: smName,
+			LabelApplied: labelApplied,
+		})
 	})
 }
 

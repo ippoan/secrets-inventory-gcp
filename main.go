@@ -27,6 +27,7 @@ import (
 	policyanalyzer "google.golang.org/api/policyanalyzer/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -296,6 +297,13 @@ type secretLister interface {
 	// caller (handler) は alreadyExists + fail_if_exists を見て 409 or
 	// 再利用 (= 既存 secret に AddVersion を続行) を選ぶ。
 	CreateSecret(ctx context.Context, parent, shortName string) (createdName string, alreadyExists bool, err error)
+	// UpdateSecretLabels は親 secret (full name) の labels に patch を merge
+	// する (既存 labels を保持しつつ patch のキーだけ上書きする)。GCP の
+	// UpdateSecret(FieldMask=labels) は labels map 全体を置換するため、内部で
+	// GetSecret → merge → UpdateSecret する。値 (secret payload) には一切
+	// 触れず、label メタデータのみ操作する。`secretmanager.secrets.get` +
+	// `.update` (= custom role `secretsInventoryLabeler`) が必要。
+	UpdateSecretLabels(ctx context.Context, secretName string, patch map[string]string) error
 }
 
 type liveLister struct {
@@ -398,6 +406,34 @@ func (l *liveLister) CreateSecret(ctx context.Context, parent, shortName string)
 		return "", false, err
 	}
 	return s.GetName(), false, nil
+}
+
+// UpdateSecretLabels は GetSecret → labels merge → UpdateSecret(FieldMask=
+// labels) で、既存 labels (= CI が打つ `used-by-*` consumer label や台帳
+// `cf_token_id` 等) を保持したまま patch のキーだけ上書きする。値 payload
+// には触れない (= AccessSecretVersion を呼ばない)。`secretmanager.secrets.get`
+// + `.update` 権限 (custom role `secretsInventoryLabeler`) が無いと gRPC
+// PermissionDenied になり caller 側で 502 にラップされる。
+func (l *liveLister) UpdateSecretLabels(ctx context.Context, secretName string, patch map[string]string) error {
+	s, err := l.c.GetSecret(ctx, &secretmanagerpb.GetSecretRequest{Name: secretName})
+	if err != nil {
+		return err
+	}
+	labels := s.GetLabels()
+	if labels == nil {
+		labels = make(map[string]string, len(patch))
+	}
+	for k, v := range patch {
+		labels[k] = v
+	}
+	_, err = l.c.UpdateSecret(ctx, &secretmanagerpb.UpdateSecretRequest{
+		Secret: &secretmanagerpb.Secret{
+			Name:   secretName,
+			Labels: labels,
+		},
+		UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"labels"}},
+	})
+	return err
 }
 
 // iamLister は IAM Admin + Resource Manager の必要部分だけ切り出した interface。
@@ -696,7 +732,7 @@ func cfServiceTokenRootDispatcher(getter secretValueGetter, cfg cfConfig, http_ 
 // list (`GET /cf/service-tokens`、no trailing slash) は別 route で受ける。
 func cfServiceTokenSubDispatcher(getter secretValueGetter, cfg cfConfig, http_ httpDoer, l secretLister, projectID string) http.Handler {
 	rotateH := handleCfServiceTokenRotate(getter, cfg, http_, l, projectID)
-	deleteH := handleCfServiceTokenDelete(getter, cfg, http_)
+	deleteH := handleCfServiceTokenDelete(getter, cfg, http_, l, projectID)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rest := strings.TrimPrefix(r.URL.Path, "/cf/service-tokens/")
 		if rest == "" {
