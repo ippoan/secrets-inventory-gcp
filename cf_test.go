@@ -268,6 +268,108 @@ func TestGh_NotConfigured_Returns503(t *testing.T) {
 	}
 }
 
+func TestCfServiceTokenCreate_OK_WritesSecretToSM_NoEcho(t *testing.T) {
+	const newSecret = "created-client-secret-abc"
+	doer := &fakeHTTPDoer{}
+	doer.respond("POST https://api.cloudflare.com/client/v4/accounts/acc/access/service_tokens",
+		200, `{"success":true,"result":{"id":"st-new","name":"ohishi-dtako-prod-api-202605","client_id":"new.access","client_secret":"`+newSecret+`","expires_at":"2027-05-29T00:00:00Z"}}`)
+	getter := &fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}
+	lister := &fakeLister{}
+
+	mux := newCfTestMuxWithLister(lister, getter, doer)
+	body := bytes.NewBufferString(`{"name":"ohishi-dtako-prod-api-202605","sm_secret_name":"dtako-api-client-secret"}`)
+	req := httptest.NewRequest(http.MethodPost, "/cf/service-tokens", body)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(lister.addedVersions) != 1 || string(lister.addedVersions[0].value) != newSecret {
+		t.Fatalf("client_secret not written to SM: %+v", lister.addedVersions)
+	}
+	if len(lister.createCalls) != 1 || lister.createCalls[0].shortName != "dtako-api-client-secret" {
+		t.Errorf("unexpected create calls: %+v", lister.createCalls)
+	}
+	if strings.Contains(rec.Body.String(), newSecret) {
+		t.Error("response must not echo the created client_secret")
+	}
+	var resp cfServiceTokenCreateResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Ok || resp.TokenID != "st-new" || resp.ClientID != "new.access" {
+		t.Errorf("unexpected resp: %+v", resp)
+	}
+	if resp.SmSecretName != "dtako-api-client-secret" || resp.SmVersion == "" || !resp.Created {
+		t.Errorf("missing SM metadata: %+v", resp)
+	}
+}
+
+func TestCfServiceTokenCreate_RejectInvalidName(t *testing.T) {
+	mux := newCfTestMux(&fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}, &fakeHTTPDoer{})
+	body := bytes.NewBufferString(`{"name":"bad\nname","sm_secret_name":"foo"}`)
+	req := httptest.NewRequest(http.MethodPost, "/cf/service-tokens", body)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", rec.Code)
+	}
+}
+
+func TestCfServiceTokenCreate_MissingSmName(t *testing.T) {
+	mux := newCfTestMux(&fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}, &fakeHTTPDoer{})
+	body := bytes.NewBufferString(`{"name":"valid-name"}`)
+	req := httptest.NewRequest(http.MethodPost, "/cf/service-tokens", body)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", rec.Code)
+	}
+}
+
+func TestCfServiceTokenCreate_UpstreamFail(t *testing.T) {
+	doer := &fakeHTTPDoer{}
+	doer.respond("POST https://api.cloudflare.com/client/v4/accounts/acc/access/service_tokens",
+		403, `{"success":false}`)
+	getter := &fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}
+	lister := &fakeLister{}
+
+	mux := newCfTestMuxWithLister(lister, getter, doer)
+	body := bytes.NewBufferString(`{"name":"valid-name","sm_secret_name":"foo"}`)
+	req := httptest.NewRequest(http.MethodPost, "/cf/service-tokens", body)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("expected 502, got %d", rec.Code)
+	}
+	if len(lister.addedVersions) != 0 {
+		t.Error("must not write SM version when CF create failed")
+	}
+}
+
+func TestCfServiceTokenCreate_Conflict(t *testing.T) {
+	doer := &fakeHTTPDoer{}
+	doer.respond("POST https://api.cloudflare.com/client/v4/accounts/acc/access/service_tokens",
+		200, `{"success":true,"result":{"id":"st-new","client_secret":"x"}}`)
+	getter := &fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}
+	lister := &fakeLister{existingSecrets: map[string]bool{"dup-secret": true}}
+
+	mux := newCfTestMuxWithLister(lister, getter, doer)
+	body := bytes.NewBufferString(`{"name":"valid-name","sm_secret_name":"dup-secret","fail_if_exists":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/cf/service-tokens", body)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Errorf("expected 409, got %d", rec.Code)
+	}
+}
+
 // newCfTestMuxWithLister は rotate の SM 書き込みを検証するため、呼び出し側が
 // fakeLister を差し込めるようにした variant。
 func newCfTestMuxWithLister(lister secretLister, getter secretValueGetter, doer httpDoer) *http.ServeMux {
@@ -528,9 +630,10 @@ func TestCfServiceTokenList_TokenFetchFailure(t *testing.T) {
 	}
 }
 
-func TestCfServiceTokenList_MethodNotAllowed(t *testing.T) {
+func TestCfServiceTokenRoot_MethodNotAllowed(t *testing.T) {
+	// GET=list / POST=create に振り分けるので、それ以外 (PUT) は 405。
 	mux := newCfTestMux(&fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}, &fakeHTTPDoer{})
-	req := httptest.NewRequest(http.MethodPost, "/cf/service-tokens", nil)
+	req := httptest.NewRequest(http.MethodPut, "/cf/service-tokens", nil)
 	req.Header.Set("X-Inventory-API-Key", "k")
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)

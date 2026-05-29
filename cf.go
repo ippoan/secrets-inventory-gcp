@@ -212,6 +212,186 @@ func handleCfServiceTokenList(getter secretValueGetter, cfg cfConfig, http_ http
 	})
 }
 
+// --- Phase 3: Service Token create (Refs #42) ------------------------------
+
+// cfServiceTokenCreateBody は worker → proxy の create request body。
+// CF は token 名の一意性を保証しないので create は常に新規発行。
+// `sm_secret_name` = 発行時に一度だけ返る client_secret の着地先。
+type cfServiceTokenCreateBody struct {
+	Name         string `json:"name"`
+	Duration     string `json:"duration,omitempty"`
+	SmSecretName string `json:"sm_secret_name"`
+	FailIfExists bool   `json:"fail_if_exists"`
+}
+
+// cfRawServiceTokenCreate は CF create API の result。**client_secret は発行時
+// のみ返る** (= 取りこぼすと再生成しかない)。
+type cfRawServiceTokenCreate struct {
+	ID           string `json:"id"`
+	Name         string `json:"name,omitempty"`
+	ClientID     string `json:"client_id,omitempty"`
+	ClientSecret string `json:"client_secret,omitempty"`
+	ExpiresAt    string `json:"expires_at,omitempty"`
+	Duration     string `json:"duration,omitempty"`
+}
+
+// cfServiceTokenCreateResponse は worker に返す metadata。**client_secret は
+// 含めない** (= proxy が SM に直書きし、値は LLM context / log に載らない)。
+type cfServiceTokenCreateResponse struct {
+	Ok           bool   `json:"ok"`
+	TokenID      string `json:"token_id"`
+	Name         string `json:"name,omitempty"`
+	ClientID     string `json:"client_id,omitempty"`
+	ExpiresAt    string `json:"expires_at,omitempty"`
+	SmSecretName string `json:"sm_secret_name"`
+	SmVersion    string `json:"sm_version"`
+	Created      bool   `json:"created"`
+}
+
+// cfServiceTokenNameOK は CF service token 名の最小 validate。非空・長さ上限・
+// 制御文字なし (= log injection 防止)。CF は名前に空白等を許すため charset は
+// 広めに取り、厳格な命名規約 enforcement は worker 側に委ねる。
+func cfServiceTokenNameOK(name string) bool {
+	if name == "" || len(name) > 128 {
+		return false
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// handleCfServiceTokenCreate は `POST /cf/service-tokens` のハンドラ。
+//
+// CF の `POST /accounts/{a}/access/service_tokens` を叩いて新規 token を発行
+// させ、**発行時のみ返る client_secret を proxy memory 内で GCP Secret Manager
+// の `sm_secret_name` に直書き**する (rotate と同経路)。client_secret は
+// response / log に一切 echo しない。
+func handleCfServiceTokenCreate(getter secretValueGetter, cfg cfConfig, http_ httpDoer, l secretLister, projectID string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		r.Body = http.MaxBytesReader(w, r.Body, 4096)
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "request body too large or unreadable", http.StatusBadRequest)
+			return
+		}
+		var body cfServiceTokenCreateBody
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			http.Error(w, "bad request body", http.StatusBadRequest)
+			return
+		}
+		if !cfServiceTokenNameOK(body.Name) {
+			http.Error(w, "invalid name", http.StatusBadRequest)
+			return
+		}
+		if body.SmSecretName == "" {
+			http.Error(w, "sm_secret_name is required", http.StatusBadRequest)
+			return
+		}
+		if !secretNamePattern.MatchString(body.SmSecretName) {
+			http.Error(w, "invalid sm_secret_name", http.StatusBadRequest)
+			return
+		}
+
+		actor := sanitizeLogValue(r.Header.Get("X-Actor-Email"))
+		target := sanitizeLogValue(body.Name)
+		smName := sanitizeLogValue(body.SmSecretName)
+		log.Printf("CF_SVCTOKEN_CREATE requested actor=%q name=%q sm_secret_name=%q fail_if_exists=%v",
+			actor, target, smName, body.FailIfExists)
+
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		defer cancel()
+
+		token, err := getter.Get(ctx, cfg.tokenSecret)
+		if err != nil {
+			log.Printf("CF_SVCTOKEN_CREATE token fetch failed name=%q err=%v", target, err)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+
+		// CF create body。duration 省略時は CF default に委ねる (送らない)。
+		reqBody := map[string]string{"name": body.Name}
+		if body.Duration != "" {
+			reqBody["duration"] = body.Duration
+		}
+		postBody, _ := json.Marshal(reqBody)
+
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+			cfg.serviceTokensBase(), strings.NewReader(string(postBody)))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", "secrets-inventory-gcp")
+
+		res, err := http_.Do(req)
+		if err != nil {
+			log.Printf("CF_SVCTOKEN_CREATE upstream network name=%q err=%v", target, err)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+		defer res.Body.Close()
+		if res.StatusCode/100 != 2 {
+			log.Printf("CF_SVCTOKEN_CREATE upstream %d name=%q", res.StatusCode, target)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+		var env cfEnvelope[cfRawServiceTokenCreate]
+		if err := json.NewDecoder(res.Body).Decode(&env); err != nil {
+			log.Printf("CF_SVCTOKEN_CREATE decode name=%q err=%v", target, err)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+		if !env.Success || env.Result.ClientSecret == "" || env.Result.ID == "" {
+			log.Printf("CF_SVCTOKEN_CREATE bad envelope name=%q success=%v", target, env.Success)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+
+		// 新 client_secret を GCP SM へ。値は newSecret 内のみ、log / response に出さない。
+		newSecret := env.Result.ClientSecret
+		parent := fmt.Sprintf("projects/%s", projectID)
+		secretFullName, alreadyExists, err := l.CreateSecret(ctx, parent, body.SmSecretName)
+		if err != nil {
+			log.Printf("CF_SVCTOKEN_CREATE sm create failed name=%q sm=%q err=%v", target, smName, err)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+		if alreadyExists && body.FailIfExists {
+			log.Printf("CF_SVCTOKEN_CREATE sm conflict name=%q sm=%q", target, smName)
+			http.Error(w, "sm secret already exists", http.StatusConflict)
+			return
+		}
+		newVersionName, err := l.AddSecretVersion(ctx, secretFullName, []byte(newSecret))
+		if err != nil {
+			log.Printf("CF_SVCTOKEN_CREATE sm add-version failed name=%q sm=%q err=%v", target, smName, err)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+
+		log.Printf("CF_SVCTOKEN_CREATE ok actor=%q name=%q token_id=%q sm=%q sm_version=%q created=%v",
+			actor, target, sanitizeLogValue(env.Result.ID), smName, sanitizeLogValue(newVersionName), !alreadyExists)
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(cfServiceTokenCreateResponse{
+			Ok:           true,
+			TokenID:      env.Result.ID,
+			Name:         env.Result.Name,
+			ClientID:     env.Result.ClientID,
+			ExpiresAt:    env.Result.ExpiresAt,
+			SmSecretName: body.SmSecretName,
+			SmVersion:    newVersionName,
+			Created:      !alreadyExists,
+		})
+	})
+}
+
 // --- Phase 2: Service Token rotate / delete (Refs #40) ---------------------
 
 // cfServiceTokenRotateBody は worker → proxy の rotate request body。
