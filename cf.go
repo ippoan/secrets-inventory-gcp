@@ -107,6 +107,111 @@ func (c cfConfig) base() string {
 	return fmt.Sprintf("%s/accounts/%s/secrets_store/stores/%s/secrets", cfAPI, c.accountID, c.storeID)
 }
 
+// serviceTokensBase は CF Access Service Token list の base URL を組み立てる。
+// Secrets Store とは **別 API** (`access/service_tokens`) で account 直下、
+// `storeID` は使わない (Refs #38)。
+func (c cfConfig) serviceTokensBase() string {
+	return fmt.Sprintf("%s/accounts/%s/access/service_tokens", cfAPI, c.accountID)
+}
+
+// cfRawServiceToken は Cloudflare Access の Service Token 1 件 (list 用)。
+// `client_secret` は list では **構造的に返らない** (= 値非漏洩) ので持たない。
+// CF API は時刻を `created_at` / `updated_at` で返す (Secrets Store の
+// `created` / `modified` とは field 名が違う)。
+type cfRawServiceToken struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	ClientID  string `json:"client_id,omitempty"`
+	Duration  string `json:"duration,omitempty"`
+	CreatedAt string `json:"created_at,omitempty"`
+	UpdatedAt string `json:"updated_at,omitempty"`
+}
+
+// cfServiceTokenView は worker にそのまま返す view。時刻は `created` /
+// `modified` に正規化して `cfSecretView` と shape を揃え、worker の
+// `SecretMetadata` への map を容易にする。`client_id` / `duration` は
+// worker 側で `extra` に載せる用 (= 突合キー候補 / 期限把握)。
+type cfServiceTokenView struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	ClientID string `json:"client_id,omitempty"`
+	Duration string `json:"duration,omitempty"`
+	Created  string `json:"created,omitempty"`
+	Modified string `json:"modified,omitempty"`
+}
+
+// cfServiceTokenListResponse は `GET /cf/service-tokens` の response。
+type cfServiceTokenListResponse struct {
+	ServiceTokens []cfServiceTokenView `json:"service_tokens"`
+}
+
+// handleCfServiceTokenList は `GET /cf/service-tokens` のハンドラ。
+// CF Access の `GET /accounts/{a}/access/service_tokens?per_page=100` を
+// 1 回叩いて返す (`handleCfList` とほぼ同型)。list は `client_secret` を
+// 返さない API なので値非漏洩の追加対応は不要。MVP は read のみ
+// (rotate/delete/create は Phase 2/3・別 issue)。Refs #38.
+func handleCfServiceTokenList(getter secretValueGetter, cfg cfConfig, http_ httpDoer) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+		defer cancel()
+
+		token, err := getter.Get(ctx, cfg.tokenSecret)
+		if err != nil {
+			log.Printf("CF_SVCTOKEN_LIST token fetch failed: %v", err)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, cfg.serviceTokensBase()+"?per_page=100", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", "secrets-inventory-gcp")
+
+		res, err := http_.Do(req)
+		if err != nil {
+			log.Printf("CF_SVCTOKEN_LIST upstream network: %v", err)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+		defer res.Body.Close()
+		if res.StatusCode/100 != 2 {
+			log.Printf("CF_SVCTOKEN_LIST upstream %d", res.StatusCode)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+
+		var env cfEnvelope[[]cfRawServiceToken]
+		if err := json.NewDecoder(res.Body).Decode(&env); err != nil {
+			log.Printf("CF_SVCTOKEN_LIST decode: %v", err)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+		if !env.Success {
+			log.Printf("CF_SVCTOKEN_LIST success=false: %v", env.Errors)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+
+		out := make([]cfServiceTokenView, 0, len(env.Result))
+		for _, s := range env.Result {
+			out = append(out, cfServiceTokenView{
+				ID:       s.ID,
+				Name:     s.Name,
+				ClientID: s.ClientID,
+				Duration: s.Duration,
+				Created:  s.CreatedAt,
+				Modified: s.UpdatedAt,
+			})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(cfServiceTokenListResponse{ServiceTokens: out})
+	})
+}
+
 // handleCfList は `GET /cf/secrets` のハンドラ。
 // Cloudflare API の list を per_page=100 (CF Secrets Store の上限) で 1 回
 // 叩いて返す。実運用の secret 数は数十なので 100 で十分、pagination 不要。

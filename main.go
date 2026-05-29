@@ -603,6 +603,12 @@ func newMuxWith(
 		handleCfRotate(valueGetter, cfCfg, httpClient))))
 	mux.Handle("/cf/secrets", requireAPIKey(apiKey, requireCfConfigured(cfCfg,
 		cfRootDispatcher(valueGetter, cfCfg, httpClient))))
+	// CF Access Service Token list (Refs ippoan/secrets-inventory-gcp#38)。
+	// Secrets Store とは別 API (`access/service_tokens`) を pass-through する
+	// read-only endpoint。worker (ippoan/secrets-inventory#62) が横断棚卸しに
+	// 載せて野良 service token を検出するために使う。
+	mux.Handle("/cf/service-tokens", requireAPIKey(apiKey, requireCfConfigured(cfCfg,
+		handleCfServiceTokenList(valueGetter, cfCfg, httpClient))))
 	mux.Handle("/gh/secrets/", requireAPIKey(apiKey, requireGhConfigured(ghCfg,
 		handleGhPut(valueGetter, ghCfg, httpClient))))
 	mux.Handle("/gh/secrets", requireAPIKey(apiKey, requireGhConfigured(ghCfg,
