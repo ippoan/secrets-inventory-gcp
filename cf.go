@@ -212,6 +212,244 @@ func handleCfServiceTokenList(getter secretValueGetter, cfg cfConfig, http_ http
 	})
 }
 
+// --- Phase 2: Service Token rotate / delete (Refs #40) ---------------------
+
+// cfServiceTokenRotateBody は worker → proxy の rotate request body。
+// `sm_secret_name` = rotate で発行される新 client_secret を着地させる GCP SM
+// short name (= cf_token_id ラベル台帳の保管先)。`fail_if_exists` は SM 側で
+// 既存衝突時に 409 にするか (true) / 既存再利用で新 version 投入するか (false)。
+type cfServiceTokenRotateBody struct {
+	SmSecretName string `json:"sm_secret_name"`
+	FailIfExists bool   `json:"fail_if_exists"`
+}
+
+// cfRawServiceTokenRotate は CF rotate API の result。create と同型で、
+// **新 client_secret を発行時に一度だけ返す** (= 取りこぼすと再生成しかない)。
+type cfRawServiceTokenRotate struct {
+	ID                  string `json:"id"`
+	ClientID            string `json:"client_id,omitempty"`
+	ClientSecret        string `json:"client_secret,omitempty"`
+	ExpiresAt           string `json:"expires_at,omitempty"`
+	ClientSecretVersion int    `json:"client_secret_version,omitempty"`
+}
+
+// cfServiceTokenRotateResponse は worker に返す metadata。**client_secret は
+// 含めない** (= proxy が SM に直書きし、値は LLM context / log に載らない)。
+type cfServiceTokenRotateResponse struct {
+	Ok                  bool   `json:"ok"`
+	TokenID             string `json:"token_id"`
+	ClientID            string `json:"client_id,omitempty"`
+	ExpiresAt           string `json:"expires_at,omitempty"`
+	ClientSecretVersion int    `json:"client_secret_version,omitempty"`
+	SmSecretName        string `json:"sm_secret_name"`
+	SmVersion           string `json:"sm_version"`
+	Created             bool   `json:"created"`
+}
+
+type cfServiceTokenDeleteResponse struct {
+	Ok      bool   `json:"ok"`
+	TokenID string `json:"token_id"`
+}
+
+// handleCfServiceTokenRotate は `POST /cf/service-tokens/{id}/rotate` のハンドラ。
+//
+// CF の `POST /accounts/{a}/access/service_tokens/{id}/rotate` を叩いて新しい
+// client_secret を発行させ、**その値を proxy memory 内で GCP Secret Manager の
+// `sm_secret_name` に書き込む** (`/create-secret` と同じ CreateSecret +
+// AddSecretVersion 経路)。client_secret は response / log に **一切 echo
+// しない**。返すのは metadata のみ。
+//
+// grace 期間 (無停止移行) は CF native 挙動に委ねる (= rotate 後の旧 secret の
+// 失効タイミングは CF 側仕様。未確定 param は proxy で送らない)。
+func handleCfServiceTokenRotate(getter secretValueGetter, cfg cfConfig, http_ httpDoer, l secretLister, projectID string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/cf/service-tokens/")
+		id = strings.TrimSuffix(id, "/rotate")
+		if id == "" || strings.Contains(id, "/") {
+			http.Error(w, "missing id", http.StatusBadRequest)
+			return
+		}
+		if !cfSecretIDPattern.MatchString(id) {
+			http.Error(w, "invalid id", http.StatusBadRequest)
+			return
+		}
+
+		r.Body = http.MaxBytesReader(w, r.Body, 4096)
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "request body too large or unreadable", http.StatusBadRequest)
+			return
+		}
+		var body cfServiceTokenRotateBody
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			http.Error(w, "bad request body", http.StatusBadRequest)
+			return
+		}
+		if body.SmSecretName == "" {
+			http.Error(w, "sm_secret_name is required", http.StatusBadRequest)
+			return
+		}
+		if !secretNamePattern.MatchString(body.SmSecretName) {
+			http.Error(w, "invalid sm_secret_name", http.StatusBadRequest)
+			return
+		}
+
+		actor := sanitizeLogValue(r.Header.Get("X-Actor-Email"))
+		target := sanitizeLogValue(id)
+		smName := sanitizeLogValue(body.SmSecretName)
+		log.Printf("CF_SVCTOKEN_ROTATE requested actor=%q token_id=%q sm_secret_name=%q fail_if_exists=%v",
+			actor, target, smName, body.FailIfExists)
+
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		defer cancel()
+
+		token, err := getter.Get(ctx, cfg.tokenSecret)
+		if err != nil {
+			log.Printf("CF_SVCTOKEN_ROTATE token fetch failed token_id=%q err=%v", target, err)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+			cfg.serviceTokensBase()+"/"+id+"/rotate", strings.NewReader("{}"))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", "secrets-inventory-gcp")
+
+		res, err := http_.Do(req)
+		if err != nil {
+			log.Printf("CF_SVCTOKEN_ROTATE upstream network token_id=%q err=%v", target, err)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+		defer res.Body.Close()
+		if res.StatusCode/100 != 2 {
+			log.Printf("CF_SVCTOKEN_ROTATE upstream %d token_id=%q", res.StatusCode, target)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+		var env cfEnvelope[cfRawServiceTokenRotate]
+		if err := json.NewDecoder(res.Body).Decode(&env); err != nil {
+			log.Printf("CF_SVCTOKEN_ROTATE decode token_id=%q err=%v", target, err)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+		if !env.Success || env.Result.ClientSecret == "" {
+			log.Printf("CF_SVCTOKEN_ROTATE bad envelope token_id=%q success=%v", target, env.Success)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+
+		// 新 client_secret を GCP SM へ。値は変数 newSecret 内のみで取り回し、
+		// log / response に出さない (= /create-secret と同じ値非漏洩規約)。
+		newSecret := env.Result.ClientSecret
+		parent := fmt.Sprintf("projects/%s", projectID)
+		secretFullName, alreadyExists, err := l.CreateSecret(ctx, parent, body.SmSecretName)
+		if err != nil {
+			log.Printf("CF_SVCTOKEN_ROTATE sm create failed token_id=%q sm=%q err=%v", target, smName, err)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+		if alreadyExists && body.FailIfExists {
+			log.Printf("CF_SVCTOKEN_ROTATE sm conflict token_id=%q sm=%q", target, smName)
+			http.Error(w, "sm secret already exists", http.StatusConflict)
+			return
+		}
+		newVersionName, err := l.AddSecretVersion(ctx, secretFullName, []byte(newSecret))
+		if err != nil {
+			log.Printf("CF_SVCTOKEN_ROTATE sm add-version failed token_id=%q sm=%q err=%v", target, smName, err)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+
+		log.Printf("CF_SVCTOKEN_ROTATE ok actor=%q token_id=%q sm=%q sm_version=%q created=%v",
+			actor, target, smName, sanitizeLogValue(newVersionName), !alreadyExists)
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(cfServiceTokenRotateResponse{
+			Ok:                  true,
+			TokenID:             id,
+			ClientID:            env.Result.ClientID,
+			ExpiresAt:           env.Result.ExpiresAt,
+			ClientSecretVersion: env.Result.ClientSecretVersion,
+			SmSecretName:        body.SmSecretName,
+			SmVersion:           newVersionName,
+			Created:             !alreadyExists,
+		})
+	})
+}
+
+// handleCfServiceTokenDelete は `DELETE /cf/service-tokens/{id}` のハンドラ。
+// CF の `DELETE /accounts/{a}/access/service_tokens/{id}` を pass-through する
+// (= 野良 token の revoke)。値・SM 連携なし。
+func handleCfServiceTokenDelete(getter secretValueGetter, cfg cfConfig, http_ httpDoer) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/cf/service-tokens/")
+		if id == "" || strings.Contains(id, "/") {
+			http.Error(w, "missing id", http.StatusBadRequest)
+			return
+		}
+		if !cfSecretIDPattern.MatchString(id) {
+			http.Error(w, "invalid id", http.StatusBadRequest)
+			return
+		}
+
+		actor := sanitizeLogValue(r.Header.Get("X-Actor-Email"))
+		target := sanitizeLogValue(id)
+		log.Printf("CF_SVCTOKEN_DELETE requested actor=%q token_id=%q", actor, target)
+
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		defer cancel()
+
+		token, err := getter.Get(ctx, cfg.tokenSecret)
+		if err != nil {
+			log.Printf("CF_SVCTOKEN_DELETE token fetch failed token_id=%q err=%v", target, err)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+
+		req, _ := http.NewRequestWithContext(ctx, http.MethodDelete,
+			cfg.serviceTokensBase()+"/"+id, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", "secrets-inventory-gcp")
+
+		res, err := http_.Do(req)
+		if err != nil {
+			log.Printf("CF_SVCTOKEN_DELETE upstream network token_id=%q err=%v", target, err)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+		defer res.Body.Close()
+		if res.StatusCode/100 != 2 {
+			log.Printf("CF_SVCTOKEN_DELETE upstream %d token_id=%q", res.StatusCode, target)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+		// 2xx かつ envelope success=false は best-effort で弾く (delete は CF 側で
+		// 成立していても envelope 不正なことがあるので 2xx を主、success を従に見る)。
+		var env cfEnvelope[json.RawMessage]
+		if err := json.NewDecoder(res.Body).Decode(&env); err == nil && !env.Success {
+			log.Printf("CF_SVCTOKEN_DELETE envelope success=false token_id=%q", target)
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+
+		log.Printf("CF_SVCTOKEN_DELETE ok actor=%q token_id=%q", actor, target)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(cfServiceTokenDeleteResponse{Ok: true, TokenID: id})
+	})
+}
+
 // handleCfList は `GET /cf/secrets` のハンドラ。
 // Cloudflare API の list を per_page=100 (CF Secrets Store の上限) で 1 回
 // 叩いて返す。実運用の secret 数は数十なので 100 で十分、pagination 不要。

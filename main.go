@@ -609,6 +609,12 @@ func newMuxWith(
 	// 載せて野良 service token を検出するために使う。
 	mux.Handle("/cf/service-tokens", requireAPIKey(apiKey, requireCfConfigured(cfCfg,
 		handleCfServiceTokenList(valueGetter, cfCfg, httpClient))))
+	// Phase 2 (Refs #40): rotate / delete。trailing slash prefix で {id} 配下を
+	// 受け、`/rotate` suffix の有無で rotate (POST) / delete (DELETE) を振り分け。
+	// rotate は新 client_secret を SM (`l`) に直書きするため secretLister と
+	// projectID を渡す。
+	mux.Handle("/cf/service-tokens/", requireAPIKey(apiKey, requireCfConfigured(cfCfg,
+		cfServiceTokenSubDispatcher(valueGetter, cfCfg, httpClient, l, projectID))))
 	mux.Handle("/gh/secrets/", requireAPIKey(apiKey, requireGhConfigured(ghCfg,
 		handleGhPut(valueGetter, ghCfg, httpClient))))
 	mux.Handle("/gh/secrets", requireAPIKey(apiKey, requireGhConfigured(ghCfg,
@@ -660,6 +666,34 @@ func cfRootDispatcher(getter secretValueGetter, cfg cfConfig, http_ httpDoer) ht
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
+	})
+}
+
+// cfServiceTokenSubDispatcher は `/cf/service-tokens/...` (trailing slash 配下)
+// を振り分ける (Refs #40):
+//   - `/cf/service-tokens/{id}/rotate` (POST)   → rotate
+//   - `/cf/service-tokens/{id}`        (DELETE) → delete
+//
+// list (`GET /cf/service-tokens`、no trailing slash) は別 route で受ける。
+func cfServiceTokenSubDispatcher(getter secretValueGetter, cfg cfConfig, http_ httpDoer, l secretLister, projectID string) http.Handler {
+	rotateH := handleCfServiceTokenRotate(getter, cfg, http_, l, projectID)
+	deleteH := handleCfServiceTokenDelete(getter, cfg, http_)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rest := strings.TrimPrefix(r.URL.Path, "/cf/service-tokens/")
+		if rest == "" {
+			http.Error(w, "missing id", http.StatusBadRequest)
+			return
+		}
+		if strings.HasSuffix(rest, "/rotate") {
+			rotateH.ServeHTTP(w, r)
+			return
+		}
+		// `{id}` のみ (= delete)。それ以外の深い path は未対応。
+		if strings.Contains(rest, "/") {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		deleteH.ServeHTTP(w, r)
 	})
 }
 
