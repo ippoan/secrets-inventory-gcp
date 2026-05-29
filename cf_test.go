@@ -268,6 +268,188 @@ func TestGh_NotConfigured_Returns503(t *testing.T) {
 	}
 }
 
+// newCfTestMuxWithLister は rotate の SM 書き込みを検証するため、呼び出し側が
+// fakeLister を差し込めるようにした variant。
+func newCfTestMuxWithLister(lister secretLister, getter secretValueGetter, doer httpDoer) *http.ServeMux {
+	return newMuxWith(
+		lister, &fakeIAMLister{}, &fakeActivityLister{},
+		getter,
+		nil,
+		cfConfig{accountID: "acc", storeID: "store", tokenSecret: "cf-token"},
+		ghConfig{org: "ippoan", tokenSecret: "gh-token"},
+		doer,
+		"proj", "k",
+	)
+}
+
+func TestCfServiceTokenRotate_OK_WritesSecretToSM_NoEcho(t *testing.T) {
+	const newSecret = "rotated-client-secret-xyz"
+	doer := &fakeHTTPDoer{}
+	doer.respond("POST https://api.cloudflare.com/client/v4/accounts/acc/access/service_tokens/st-1/rotate",
+		200, `{"success":true,"result":{"id":"st-1","client_id":"abc.access","client_secret":"`+newSecret+`","expires_at":"2027-01-01T00:00:00Z","client_secret_version":2}}`)
+	getter := &fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}
+	lister := &fakeLister{}
+
+	mux := newCfTestMuxWithLister(lister, getter, doer)
+	body := bytes.NewBufferString(`{"sm_secret_name":"testone-client-secret"}`)
+	req := httptest.NewRequest(http.MethodPost, "/cf/service-tokens/st-1/rotate", body)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	// 新 client_secret が SM に書き込まれている (= AddSecretVersion に渡った)
+	if len(lister.addedVersions) != 1 {
+		t.Fatalf("expected 1 AddSecretVersion call, got %d", len(lister.addedVersions))
+	}
+	if got := string(lister.addedVersions[0].value); got != newSecret {
+		t.Errorf("SM written value mismatch: got %q", got)
+	}
+	if len(lister.createCalls) != 1 || lister.createCalls[0].shortName != "testone-client-secret" {
+		t.Errorf("unexpected create calls: %+v", lister.createCalls)
+	}
+	// response / log に client_secret が echo されていない
+	if strings.Contains(rec.Body.String(), newSecret) {
+		t.Error("response must not echo the rotated client_secret")
+	}
+	var resp cfServiceTokenRotateResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Ok || resp.TokenID != "st-1" || resp.ClientID != "abc.access" {
+		t.Errorf("unexpected resp: %+v", resp)
+	}
+	if resp.SmSecretName != "testone-client-secret" || resp.SmVersion == "" {
+		t.Errorf("missing SM metadata: %+v", resp)
+	}
+	if resp.Created != true || resp.ClientSecretVersion != 2 {
+		t.Errorf("unexpected created/version: %+v", resp)
+	}
+}
+
+func TestCfServiceTokenRotate_MissingSmName(t *testing.T) {
+	mux := newCfTestMux(&fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}, &fakeHTTPDoer{})
+	req := httptest.NewRequest(http.MethodPost, "/cf/service-tokens/st-1/rotate", bytes.NewBufferString(`{}`))
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", rec.Code)
+	}
+}
+
+func TestCfServiceTokenRotate_Conflict(t *testing.T) {
+	doer := &fakeHTTPDoer{}
+	doer.respond("POST https://api.cloudflare.com/client/v4/accounts/acc/access/service_tokens/st-1/rotate",
+		200, `{"success":true,"result":{"id":"st-1","client_secret":"x"}}`)
+	getter := &fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}
+	lister := &fakeLister{existingSecrets: map[string]bool{"dup-secret": true}}
+
+	mux := newCfTestMuxWithLister(lister, getter, doer)
+	req := httptest.NewRequest(http.MethodPost, "/cf/service-tokens/st-1/rotate",
+		bytes.NewBufferString(`{"sm_secret_name":"dup-secret","fail_if_exists":true}`))
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Errorf("expected 409, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	// 衝突時は AddSecretVersion を呼ばない
+	if len(lister.addedVersions) != 0 {
+		t.Errorf("must not write version on conflict")
+	}
+}
+
+func TestCfServiceTokenRotate_UpstreamFail(t *testing.T) {
+	doer := &fakeHTTPDoer{}
+	doer.respond("POST https://api.cloudflare.com/client/v4/accounts/acc/access/service_tokens/st-1/rotate",
+		403, `{"success":false,"errors":[{"code":9109,"message":"scope"}]}`)
+	getter := &fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}
+	lister := &fakeLister{}
+
+	mux := newCfTestMuxWithLister(lister, getter, doer)
+	req := httptest.NewRequest(http.MethodPost, "/cf/service-tokens/st-1/rotate",
+		bytes.NewBufferString(`{"sm_secret_name":"foo"}`))
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("expected 502, got %d", rec.Code)
+	}
+	if len(lister.addedVersions) != 0 {
+		t.Errorf("must not write SM version when CF rotate failed")
+	}
+}
+
+func TestCfServiceTokenRotate_RejectInvalidID(t *testing.T) {
+	mux := newCfTestMux(&fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}, &fakeHTTPDoer{})
+	req := httptest.NewRequest(http.MethodPost, "/cf/service-tokens/has%2Fslash/rotate",
+		bytes.NewBufferString(`{"sm_secret_name":"foo"}`))
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", rec.Code)
+	}
+}
+
+func TestCfServiceTokenDelete_OK(t *testing.T) {
+	doer := &fakeHTTPDoer{}
+	doer.respond("DELETE https://api.cloudflare.com/client/v4/accounts/acc/access/service_tokens/st-9",
+		200, `{"success":true,"result":{"id":"st-9"}}`)
+	getter := &fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}
+
+	mux := newCfTestMux(getter, doer)
+	req := httptest.NewRequest(http.MethodDelete, "/cf/service-tokens/st-9", nil)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp cfServiceTokenDeleteResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Ok || resp.TokenID != "st-9" {
+		t.Errorf("unexpected: %+v", resp)
+	}
+	if doer.calls[0].Method != http.MethodDelete {
+		t.Errorf("expected DELETE upstream, got %s", doer.calls[0].Method)
+	}
+}
+
+func TestCfServiceTokenDelete_UpstreamFail(t *testing.T) {
+	doer := &fakeHTTPDoer{}
+	doer.respond("DELETE https://api.cloudflare.com/client/v4/accounts/acc/access/service_tokens/st-9",
+		500, "boom")
+	getter := &fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}
+
+	mux := newCfTestMux(getter, doer)
+	req := httptest.NewRequest(http.MethodDelete, "/cf/service-tokens/st-9", nil)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("expected 502, got %d", rec.Code)
+	}
+}
+
+func TestCfServiceTokenDelete_MethodGuard(t *testing.T) {
+	// GET to /cf/service-tokens/{id} (no /rotate) は delete handler に流れ、
+	// DELETE 以外なので 405。
+	mux := newCfTestMux(&fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}, &fakeHTTPDoer{})
+	req := httptest.NewRequest(http.MethodGet, "/cf/service-tokens/st-9", nil)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405, got %d", rec.Code)
+	}
+}
+
 func TestCfServiceTokenList_OK(t *testing.T) {
 	doer := &fakeHTTPDoer{}
 	doer.respond("GET https://api.cloudflare.com/client/v4/accounts/acc/access/service_tokens?per_page=100",
