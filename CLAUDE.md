@@ -116,6 +116,18 @@ PR テンプレートは `.github/pull_request_template.md` で `Refs` を強制
     Go の `golang.org/x/crypto/nacl/box.SealAnonymous` を使用。PAT は
     `gh-secrets-inventory-org-secrets-write` から runtime 取得 (5 分 TTL)。
     `X-Fail-If-Exists: true` で事前 GET → 200 なら 409 reject
+  - **CF service token delete の audit label patch (`DELETE /cf/service-tokens/{id}?sm_secret_name=`)**
+    — Refs #68。`delete_service_token` に `sm_secret_name` を渡すと、CF token を
+    revoke した後にその client_secret 保管 SM secret へ `cf_service_token=deleted`
+    label を打つ (= 台帳が空でも明示渡しで対象 secret を特定できる audit 経路)。
+    GetSecret → labels merge → UpdateSecret(FieldMask=labels) で、CI が打つ
+    `used-by-*` consumer label や台帳 `cf_token_id` を保持したまま patch する。
+    **値 (client_secret) には触れない** (= AccessSecretVersion を呼ばない、label
+    メタデータのみ操作)。label patch が失敗しても CF revoke は成立済みなので
+    handler は 200 + `label_applied:false` を返す (fatal にしない)。
+    この endpoint には **runtime SA に `secretmanager.secrets.update` + `.get`**
+    (= 既存 custom role `secretsInventoryLabeler`、従来は staging-deploy SA だけに
+    付与していた) が必要。delete / value read は引き続き付けない。
 
 ## 環境
 
@@ -283,6 +295,29 @@ cloud-run-deploy.yml` reusable で **AR remote-repo (pull-through cache)
   GitHub PAT に必要な scope: `admin:org` (= org secrets write)。fine-grained
   PAT なら `organization_secrets: read+write`。値は Secret Manager に置く
   だけで、worker (`secrets-inventory`) からは見えない
+
+  `delete_service_token` の audit label patch (`?sm_secret_name=`、Refs #68) を
+  有効化する場合は、runtime SA にも label 用 custom role を grant する
+  (= 従来 staging-deploy SA だけに付けていた `secretsInventoryLabeler`):
+  ```bash
+  # secretsInventoryLabeler は secret-verify-gcp の apply_labels 用に既存
+  # (= secretmanager.secrets.update + .get)。無ければ先に作る:
+  gcloud iam roles describe secretsInventoryLabeler --project=cloudsql-sv >/dev/null 2>&1 || \
+    gcloud iam roles create secretsInventoryLabeler \
+      --project=cloudsql-sv \
+      --title="Secrets Inventory Labeler" \
+      --description="Update Secret Manager secret labels only (no delete, no value read)" \
+      --permissions=secretmanager.secrets.update,secretmanager.secrets.get \
+      --stage=GA
+
+  gcloud projects add-iam-policy-binding cloudsql-sv \
+    --member="serviceAccount:secrets-inventory-viewer@cloudsql-sv.iam.gserviceaccount.com" \
+    --role="projects/cloudsql-sv/roles/secretsInventoryLabeler"
+  ```
+  未 grant のまま `?sm_secret_name=` を渡しても CF revoke は成功し、label patch
+  だけが `label_applied:false` で skip される (handler は 200 を返す) ので、
+  運用 step として後追いできる。`update` を足しても delete / value read は
+  付与されない (= read-only + 最小 write 例外の方針を維持)。
 
 - **AR remote-repo**: `asia-northeast1-docker.pkg.dev/cloudsql-sv/ghcr/`
   (既存、daiun-salary 等と共有。`ippoan/secrets-inventory-gcp` という

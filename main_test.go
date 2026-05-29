@@ -49,6 +49,11 @@ type fakeLister struct {
 	existingSecrets map[string]bool
 	createSecretErr error
 	createCalls     []createCall
+
+	// UpdateSecretLabels の挙動。`updateLabelsErr` non-nil なら error、
+	// `updateLabelsCalls` に呼び出し (full name + patch) を記録する。
+	updateLabelsErr   error
+	updateLabelsCalls []updateLabelsCall
 }
 
 type addCall struct {
@@ -59,6 +64,11 @@ type addCall struct {
 type createCall struct {
 	parent    string
 	shortName string
+}
+
+type updateLabelsCall struct {
+	secretName string
+	patch      map[string]string
 }
 
 func (f *fakeLister) ListSecrets(_ context.Context, parent string) ([]*secretmanagerpb.Secret, error) {
@@ -100,6 +110,18 @@ func (f *fakeLister) AddSecretVersion(_ context.Context, secretName string, valu
 		return f.addVersionNameFn(secretName), nil
 	}
 	return secretName + "/versions/MOCK", nil
+}
+
+func (f *fakeLister) UpdateSecretLabels(_ context.Context, secretName string, patch map[string]string) error {
+	f.mu.Lock()
+	// patch を defensive copy する (caller の map mutate に巻き込まれない)
+	cp := make(map[string]string, len(patch))
+	for k, v := range patch {
+		cp[k] = v
+	}
+	f.updateLabelsCalls = append(f.updateLabelsCalls, updateLabelsCall{secretName: secretName, patch: cp})
+	f.mu.Unlock()
+	return f.updateLabelsErr
 }
 
 func (f *fakeLister) CreateSecret(_ context.Context, parent, shortName string) (string, bool, error) {

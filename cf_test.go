@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -520,6 +521,120 @@ func TestCfServiceTokenDelete_OK(t *testing.T) {
 	}
 	if doer.calls[0].Method != http.MethodDelete {
 		t.Errorf("expected DELETE upstream, got %s", doer.calls[0].Method)
+	}
+}
+
+// sm_secret_name 無しの delete は label patch を一切呼ばない (= 従来 pass-through 挙動)。
+func TestCfServiceTokenDelete_NoSmSecretName_SkipsLabel(t *testing.T) {
+	doer := &fakeHTTPDoer{}
+	doer.respond("DELETE https://api.cloudflare.com/client/v4/accounts/acc/access/service_tokens/st-9",
+		200, `{"success":true,"result":{"id":"st-9"}}`)
+	getter := &fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}
+	lister := &fakeLister{}
+
+	mux := newCfTestMuxWithLister(lister, getter, doer)
+	req := httptest.NewRequest(http.MethodDelete, "/cf/service-tokens/st-9", nil)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp cfServiceTokenDeleteResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.LabelApplied {
+		t.Errorf("label_applied should be false when sm_secret_name absent: %+v", resp)
+	}
+	if len(lister.updateLabelsCalls) != 0 {
+		t.Errorf("expected 0 UpdateSecretLabels calls, got %d", len(lister.updateLabelsCalls))
+	}
+}
+
+// sm_secret_name 付き delete は revoke 成功後に該当 SM secret へ
+// `cf_service_token=deleted` audit label を打ち、label_applied=true を返す。
+func TestCfServiceTokenDelete_WithSmSecretName_AppliesLabel(t *testing.T) {
+	doer := &fakeHTTPDoer{}
+	doer.respond("DELETE https://api.cloudflare.com/client/v4/accounts/acc/access/service_tokens/st-9",
+		200, `{"success":true,"result":{"id":"st-9"}}`)
+	getter := &fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}
+	lister := &fakeLister{}
+
+	mux := newCfTestMuxWithLister(lister, getter, doer)
+	req := httptest.NewRequest(http.MethodDelete,
+		"/cf/service-tokens/st-9?sm_secret_name=testone-client-secret", nil)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp cfServiceTokenDeleteResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Ok || !resp.LabelApplied || resp.SmSecretName != "testone-client-secret" {
+		t.Errorf("unexpected resp: %+v", resp)
+	}
+	if len(lister.updateLabelsCalls) != 1 {
+		t.Fatalf("expected 1 UpdateSecretLabels call, got %d", len(lister.updateLabelsCalls))
+	}
+	call := lister.updateLabelsCalls[0]
+	if call.secretName != "projects/proj/secrets/testone-client-secret" {
+		t.Errorf("unexpected secret full name: %q", call.secretName)
+	}
+	if call.patch[cfServiceTokenDeletedLabelKey] != cfServiceTokenDeletedLabelVal {
+		t.Errorf("unexpected patch: %+v", call.patch)
+	}
+}
+
+// label patch が失敗しても CF revoke は成立済みなので 200 + label_applied=false を返す。
+func TestCfServiceTokenDelete_LabelPatchError_StillOK(t *testing.T) {
+	doer := &fakeHTTPDoer{}
+	doer.respond("DELETE https://api.cloudflare.com/client/v4/accounts/acc/access/service_tokens/st-9",
+		200, `{"success":true,"result":{"id":"st-9"}}`)
+	getter := &fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}
+	lister := &fakeLister{updateLabelsErr: errors.New("permission denied")}
+
+	mux := newCfTestMuxWithLister(lister, getter, doer)
+	req := httptest.NewRequest(http.MethodDelete,
+		"/cf/service-tokens/st-9?sm_secret_name=testone-client-secret", nil)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp cfServiceTokenDeleteResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Ok || resp.LabelApplied {
+		t.Errorf("expected ok=true label_applied=false, got %+v", resp)
+	}
+}
+
+// 不正な sm_secret_name は CF revoke を打つ前に 400 で弾く (副作用ゼロ)。
+func TestCfServiceTokenDelete_InvalidSmSecretName_400(t *testing.T) {
+	doer := &fakeHTTPDoer{}
+	getter := &fakeSecretValueGetter{values: map[string]string{"cf-token": "tok"}}
+	lister := &fakeLister{}
+
+	mux := newCfTestMuxWithLister(lister, getter, doer)
+	req := httptest.NewRequest(http.MethodDelete,
+		"/cf/service-tokens/st-9?sm_secret_name=-bad-leading-hyphen", nil)
+	req.Header.Set("X-Inventory-API-Key", "k")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(doer.calls) != 0 {
+		t.Errorf("expected no upstream CF call on invalid sm_secret_name, got %d", len(doer.calls))
+	}
+	if len(lister.updateLabelsCalls) != 0 {
+		t.Errorf("expected no label patch on invalid sm_secret_name, got %d", len(lister.updateLabelsCalls))
 	}
 }
 
