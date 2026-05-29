@@ -603,12 +603,12 @@ func newMuxWith(
 		handleCfRotate(valueGetter, cfCfg, httpClient))))
 	mux.Handle("/cf/secrets", requireAPIKey(apiKey, requireCfConfigured(cfCfg,
 		cfRootDispatcher(valueGetter, cfCfg, httpClient))))
-	// CF Access Service Token list (Refs ippoan/secrets-inventory-gcp#38)。
-	// Secrets Store とは別 API (`access/service_tokens`) を pass-through する
-	// read-only endpoint。worker (ippoan/secrets-inventory#62) が横断棚卸しに
-	// 載せて野良 service token を検出するために使う。
+	// CF Access Service Token (Refs ippoan/secrets-inventory-gcp#38 list / #42 create)。
+	// Secrets Store とは別 API (`access/service_tokens`)。GET=list / POST=create を
+	// root dispatcher で method 振り分け (`/cf/secrets` と同じ pattern)。create は
+	// 新 client_secret を SM (`l`) に直書きするため secretLister と projectID を渡す。
 	mux.Handle("/cf/service-tokens", requireAPIKey(apiKey, requireCfConfigured(cfCfg,
-		handleCfServiceTokenList(valueGetter, cfCfg, httpClient))))
+		cfServiceTokenRootDispatcher(valueGetter, cfCfg, httpClient, l, projectID))))
 	// Phase 2 (Refs #40): rotate / delete。trailing slash prefix で {id} 配下を
 	// 受け、`/rotate` suffix の有無で rotate (POST) / delete (DELETE) を振り分け。
 	// rotate は新 client_secret を SM (`l`) に直書きするため secretLister と
@@ -657,6 +657,25 @@ func requireGhConfigured(cfg ghConfig, next http.Handler) http.Handler {
 func cfRootDispatcher(getter secretValueGetter, cfg cfConfig, http_ httpDoer) http.Handler {
 	listH := handleCfList(getter, cfg, http_)
 	createH := handleCfCreate(getter, cfg, http_)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			listH.ServeHTTP(w, r)
+		case http.MethodPost:
+			createH.ServeHTTP(w, r)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+}
+
+// cfServiceTokenRootDispatcher は `/cf/service-tokens` (no trailing slash) を
+// method 別に振り分ける (Refs #38 list / #42 create):
+//   - GET  → list
+//   - POST → create
+func cfServiceTokenRootDispatcher(getter secretValueGetter, cfg cfConfig, http_ httpDoer, l secretLister, projectID string) http.Handler {
+	listH := handleCfServiceTokenList(getter, cfg, http_)
+	createH := handleCfServiceTokenCreate(getter, cfg, http_, l, projectID)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
