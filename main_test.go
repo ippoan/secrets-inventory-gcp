@@ -1776,3 +1776,125 @@ func TestCreateSecretEmptyBody(t *testing.T) {
 		t.Errorf("status = %d, want 400", rec.Code)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// trailing whitespace 防御 (ippoan/auth-worker#208 再発防止)
+//
+// echo 投入で末尾 `\n` が混入し、消費側 (OAuth audience の string compare) が
+// silent fail した事故の再発を投入経路で止める。default reject、
+// X-Allow-Trailing-Whitespace: true で明示許可。
+// ---------------------------------------------------------------------------
+
+func TestAddVersionRejectsTrailingWhitespace(t *testing.T) {
+	f := &fakeLister{
+		addVersionNameFn: func(secretName string) string { return secretName + "/versions/9" },
+	}
+	mux := newMuxWithTest(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+
+	const dirty = "client-id-value\n" // echo "$v" | gcloud ... 相当の末尾 newline
+	body, _ := json.Marshal(addVersionRequest{Value: dirty})
+	req := httptest.NewRequest(http.MethodPost, "/add-version?name=MY_SECRET", bytes.NewReader(body))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	req.Header.Set("X-Actor-Email", "actor@example.com")
+	rec := httptest.NewRecorder()
+	logBuf := captureLog(t)
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", rec.Code, rec.Body.String())
+	}
+	// 投入は一切起きていないこと (= 汚れた値が GCP に届かない)
+	if len(f.addedVersions) != 0 {
+		t.Errorf("addedVersions = %d, want 0 (reject before upstream)", len(f.addedVersions))
+	}
+	// 値そのものは log にも response にも echo されない (既存 spec を維持)
+	if strings.Contains(rec.Body.String(), dirty) || strings.Contains(logBuf.String(), dirty) {
+		t.Errorf("leaked value")
+	}
+}
+
+func TestAddVersionAllowsTrailingWhitespaceWithHeader(t *testing.T) {
+	f := &fakeLister{
+		addVersionNameFn: func(secretName string) string { return secretName + "/versions/9" },
+	}
+	mux := newMuxWithTest(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+
+	// PEM 鍵など末尾改行が正当な値: X-Allow-Trailing-Whitespace: true で許可。
+	const pem = "-----BEGIN KEY-----\nabc\n-----END KEY-----\n"
+	body, _ := json.Marshal(addVersionRequest{Value: pem})
+	req := httptest.NewRequest(http.MethodPost, "/add-version?name=MY_SECRET", bytes.NewReader(body))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	req.Header.Set("X-Allow-Trailing-Whitespace", "true")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	// raw 投入の実証: 末尾改行を含め入力どおり upstream へ届く (trim しない)。
+	if len(f.addedVersions) != 1 {
+		t.Fatalf("addedVersions = %d, want 1", len(f.addedVersions))
+	}
+	if string(f.addedVersions[0].value) != pem {
+		t.Errorf("value not forwarded as-is (raw 投入が壊れている): %q", string(f.addedVersions[0].value))
+	}
+}
+
+func TestAddVersionInvalidAllowTrailingWhitespaceHeader(t *testing.T) {
+	f := &fakeLister{}
+	mux := newMuxWithTest(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	body, _ := json.Marshal(addVersionRequest{Value: "ok"})
+	req := httptest.NewRequest(http.MethodPost, "/add-version?name=MY_SECRET", bytes.NewReader(body))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	req.Header.Set("X-Allow-Trailing-Whitespace", "maybe")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+	if len(f.addedVersions) != 0 {
+		t.Errorf("addedVersions = %d, want 0", len(f.addedVersions))
+	}
+}
+
+func TestCreateSecretRejectsTrailingWhitespace(t *testing.T) {
+	f := &fakeLister{
+		addVersionNameFn: func(secretName string) string { return secretName + "/versions/1" },
+	}
+	mux := newMuxWithTest(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	body, _ := json.Marshal(createSecretRequest{Value: "new-secret-value\n"})
+	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=NEW_SECRET", bytes.NewReader(body))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", rec.Code, rec.Body.String())
+	}
+	// secret 作成も version 投入も起きていないこと
+	if len(f.createCalls) != 0 {
+		t.Errorf("createCalls = %d, want 0", len(f.createCalls))
+	}
+	if len(f.addedVersions) != 0 {
+		t.Errorf("addedVersions = %d, want 0", len(f.addedVersions))
+	}
+}
+
+func TestCreateSecretAllowsTrailingWhitespaceWithHeader(t *testing.T) {
+	f := &fakeLister{
+		addVersionNameFn: func(secretName string) string { return secretName + "/versions/1" },
+	}
+	mux := newMuxWithTest(f, &fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	const val = "value-with-trailing\n"
+	body, _ := json.Marshal(createSecretRequest{Value: val})
+	req := httptest.NewRequest(http.MethodPost, "/create-secret?name=NEW_SECRET", bytes.NewReader(body))
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	req.Header.Set("X-Allow-Trailing-Whitespace", "1")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if len(f.addedVersions) != 1 || string(f.addedVersions[0].value) != val {
+		t.Errorf("value not forwarded as-is with allow header")
+	}
+}

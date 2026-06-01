@@ -92,7 +92,12 @@ PR テンプレートは `.github/pull_request_template.md` で `Refs` を強制
     一切 echo しない** (handler / test で固定)。`X-Expected-Version-Id`
     header で TOCTOU 検証可能 (= "rotate 直前の version が想定通りでなければ
     409 で reject"、UI ヒューマンエラー対策。strict consistency が必要な
-    場合は別途 KV lock を被せる)
+    場合は別途 KV lock を被せる)。**`value` 末尾に空白 (newline/space/tab) が
+    あると default で 400 reject** — `X-Allow-Trailing-Whitespace: true` を
+    明示した時だけ許可する (ippoan/auth-worker#208: `echo` 投入で末尾 `\n` が
+    混入し消費側の OAuth audience string compare が silent fail した事故の
+    再発防止。投入値自体は trim せず raw のまま渡す = PEM 鍵など末尾改行が
+    正当な値は header で明示許可する)
   - **secret `create-secret` (`POST /create-secret`)** — 新規 secret を
     automatic replication で作成し、続けて initial value を version 1 として
     投入。`secretmanager.secretCreator` + `secretVersionAdder` の組み合わせで
@@ -100,7 +105,9 @@ PR テンプレートは `.github/pull_request_template.md` で `Refs` を強制
     response に echo しない。`X-Fail-If-Exists: true` (default) で既存 name
     衝突は 409、`false` 明示で既存 secret 再利用 (= new version 投入)。
     response の `created` boolean で 2 経路を識別できる。replication policy
-    は automatic 固定 (region 限定が必要になれば別 endpoint or query で拡張)
+    は automatic 固定 (region 限定が必要になれば別 endpoint or query で拡張)。
+    `value` の trailing whitespace は add-version と同じく default reject
+    (`X-Allow-Trailing-Whitespace: true` で許可)
   - **CF Secrets Store proxy (`/cf/secrets*`)** — ippoan/secrets-inventory#45
     で worker の `CF_API_TOKEN` binding を本 proxy に集約したもの。
     `GET /cf/secrets` (list)、`POST /cf/secrets` (create)、
