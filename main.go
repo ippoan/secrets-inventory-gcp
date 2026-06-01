@@ -850,6 +850,10 @@ const maxSecretValueBytes = 65536
 //   - `X-Actor-Email` (optional): 実操作者 email。actor audit log 用
 //   - `X-Expected-Version-Id` (optional): TOCTOU 検証。指定すると AddVersion
 //     直前に latest version id を確認し、不一致なら 409 で reject
+//   - `X-Allow-Trailing-Whitespace` (optional, default "false"): 末尾に空白
+//     (newline/space/tab) を持つ値を許可するか。default は reject (400)。
+//     ippoan/auth-worker#208 (echo 投入 → trailing `\n` 混入 → 消費側 silent
+//     fail) の再発防止。PEM 鍵など末尾改行が正当な値だけ "true" を明示する
 //
 // response:
 //
@@ -888,6 +892,12 @@ func handleAddSecretVersion(l secretLister, projectID string) http.Handler {
 			return
 		}
 
+		allowTrailingWS, ok := allowTrailingWhitespaceHeader(r)
+		if !ok {
+			http.Error(w, "invalid X-Allow-Trailing-Whitespace (use true|false)", http.StatusBadRequest)
+			return
+		}
+
 		// body は 64KiB + 小さな JSON envelope slack 程度で打ち切る。
 		// それ以上はそもそも GCP 側でも reject されるが、proxy で先に打って
 		// memory pressure と log 汚染を抑える。
@@ -908,6 +918,12 @@ func handleAddSecretVersion(l secretLister, projectID string) http.Handler {
 		}
 		if len(req.Value) > maxSecretValueBytes {
 			http.Error(w, "value too large", http.StatusBadRequest)
+			return
+		}
+		if !allowTrailingWS && hasTrailingWhitespace(req.Value) {
+			log.Printf("ADD_VERSION rejected trailing-whitespace actor=%q target=%q value_bytes=%d",
+				actor, target, len(req.Value))
+			http.Error(w, "value has trailing whitespace (newline/space/tab); set X-Allow-Trailing-Whitespace: true if intentional", http.StatusBadRequest)
 			return
 		}
 
@@ -979,6 +995,9 @@ func handleAddSecretVersion(l secretLister, projectID string) http.Handler {
 //   - `X-Fail-If-Exists` (optional, default "true"):
 //       - "true"  → 既存 name 衝突で 409、AddVersion は呼ばない
 //       - "false" → 既存 secret を再利用して AddVersion を続行 (新 version)
+//   - `X-Allow-Trailing-Whitespace` (optional, default "false"): 末尾に空白
+//     (newline/space/tab) を持つ値を許可するか。default は reject (400)。
+//     ippoan/auth-worker#208 の再発防止 (add-version と同じ規約)
 //
 // body:
 //
@@ -1030,6 +1049,12 @@ func handleCreateSecret(l secretLister, projectID string) http.Handler {
 			}
 		}
 
+		allowTrailingWS, ok := allowTrailingWhitespaceHeader(r)
+		if !ok {
+			http.Error(w, "invalid X-Allow-Trailing-Whitespace (use true|false)", http.StatusBadRequest)
+			return
+		}
+
 		// body 読み込み (add-version と同じ MaxBytesReader policy)
 		r.Body = http.MaxBytesReader(w, r.Body, maxSecretValueBytes+1024)
 		bodyBytes, err := io.ReadAll(r.Body)
@@ -1048,6 +1073,12 @@ func handleCreateSecret(l secretLister, projectID string) http.Handler {
 		}
 		if len(req.Value) > maxSecretValueBytes {
 			http.Error(w, "value too large", http.StatusBadRequest)
+			return
+		}
+		if !allowTrailingWS && hasTrailingWhitespace(req.Value) {
+			log.Printf("CREATE_SECRET rejected trailing-whitespace actor=%q target=%q value_bytes=%d",
+				actor, target, len(req.Value))
+			http.Error(w, "value has trailing whitespace (newline/space/tab); set X-Allow-Trailing-Whitespace: true if intentional", http.StatusBadRequest)
 			return
 		}
 
@@ -1105,6 +1136,37 @@ func sanitizeLogValue(s string) string {
 		s = s[:256] + "..."
 	}
 	return s
+}
+
+// hasTrailingWhitespace は値の末尾に空白文字 (space / tab / CR / LF) があるか判定する。
+//
+// ippoan/auth-worker#208: GCP Secret Manager の GOOGLE_CLIENT_ID を
+// `echo "$v" | gcloud secrets versions add` で投入して末尾に `\n` が混入し、
+// 消費側 (rust-alc-api の OAuth audience string compare) が silent fail した事故の
+// 再発防止。/add-version /create-secret は `[]byte(req.Value)` を raw 投入する
+// (= echo を介さないので proxy 経由なら本来 newline は入らない) が、呼び出し側が
+// 誤って trailing newline 付きの値を渡せばそのまま投入されてしまうため、投入前に
+// 検出して default で reject する (X-Allow-Trailing-Whitespace: true で明示許可)。
+func hasTrailingWhitespace(s string) bool {
+	return strings.TrimRight(s, " \t\r\n") != s
+}
+
+// allowTrailingWhitespaceHeader は X-Allow-Trailing-Whitespace header を解釈する。
+// 空なら default false (= 末尾空白を reject)。不正値は ok=false を返し caller が
+// 400 にする。PEM 鍵など末尾改行が正当な値を投入する場合だけ true を明示する。
+func allowTrailingWhitespaceHeader(r *http.Request) (allow bool, ok bool) {
+	v := r.Header.Get("X-Allow-Trailing-Whitespace")
+	if v == "" {
+		return false, true
+	}
+	switch strings.ToLower(v) {
+	case "true", "1", "yes":
+		return true, true
+	case "false", "0", "no":
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 func handleListSecrets(l secretLister, projectID string) http.Handler {
