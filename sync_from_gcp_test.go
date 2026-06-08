@@ -119,7 +119,7 @@ func TestSyncFromGcp_CfTargetButCfCfgMissing(t *testing.T) {
 	mux := newMuxWith(
 		&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{},
 		&fakeSecretValueGetter{},
-		nil, // srcGetter
+		nil,        // srcGetter
 		cfConfig{}, // not configured
 		ghConfig{org: "ippoan", tokenSecret: "gh-token"},
 		&fakeHTTPDoer{},

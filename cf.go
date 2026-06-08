@@ -49,9 +49,9 @@ type cfRawSecret struct {
 }
 
 type cfEnvelope[T any] struct {
-	Success bool     `json:"success"`
-	Result  T        `json:"result"`
-	Errors  []cfErr  `json:"errors,omitempty"`
+	Success bool    `json:"success"`
+	Result  T       `json:"result"`
+	Errors  []cfErr `json:"errors,omitempty"`
 }
 
 type cfErr struct {

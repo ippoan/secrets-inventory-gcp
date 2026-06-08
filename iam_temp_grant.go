@@ -50,8 +50,8 @@ const (
 
 	// AccessSecretVersion を retry する deadline。IAM propagation lag は
 	// 実測 1〜5 秒程度。8 秒見ておけば 99%ile に収まる。
-	tempGrantReadDeadline = 8 * time.Second
-	tempGrantReadBackoff  = 200 * time.Millisecond
+	tempGrantReadDeadline   = 8 * time.Second
+	tempGrantReadBackoff    = 200 * time.Millisecond
 	tempGrantReadBackoffCap = 2 * time.Second
 
 	// SetIamPolicy が etag CAS で衝突 (Aborted) した時の retry 回数。

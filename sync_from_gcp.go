@@ -48,8 +48,8 @@ import (
 //     未 grant なら AccessSecretVersion で PermissionDenied → 502。
 
 type syncTargetResult struct {
-	Status     string `json:"status"`              // "ok" | "fail"
-	Error      string `json:"error,omitempty"`     // status=fail のときのみ
+	Status     string `json:"status"`          // "ok" | "fail"
+	Error      string `json:"error,omitempty"` // status=fail のときのみ
 	SecretName string `json:"secret_name,omitempty"`
 	SecretID   string `json:"secret_id,omitempty"` // CF のみ
 	Created    bool   `json:"created,omitempty"`
@@ -64,12 +64,12 @@ type syncFromGcpResponse struct {
 // handleSyncFromGcp は sync handler を返す。
 //
 //   - getter:    CF / GH proxy token 等の **既に per-secret accessor が
-//                permanent grant 済の secret** を読む。propagateToGh/Cf 内で
-//                cfg.tokenSecret を取るのに使う。
+//     permanent grant 済の secret** を読む。propagateToGh/Cf 内で
+//     cfg.tokenSecret を取るのに使う。
 //   - srcGetter: 本 endpoint の **source secret** (= sync 対象) を読む。
-//                temp grant 経路 (grantingSrcReader) または直接 getter のどちらか。
-//                nil なら getter にフォールバックして従来挙動 (= operator が
-//                事前 gcloud grant した secret しか sync できない)。
+//     temp grant 経路 (grantingSrcReader) または直接 getter のどちらか。
+//     nil なら getter にフォールバックして従来挙動 (= operator が
+//     事前 gcloud grant した secret しか sync できない)。
 func handleSyncFromGcp(
 	getter secretValueGetter,
 	srcGetter secretValueGetter,
@@ -190,7 +190,7 @@ func handleSyncFromGcp(
 		if err != nil {
 			log.Printf("SYNC_FROM_GCP source read failed actor=%q source=%q err=%v",
 				actor, source, err)
-			http.Error(w, "upstream error (gcp read)", http.StatusBadGateway)
+			http.Error(w, "upstream error (gcp read)", grpcToHTTPStatus(err))
 			return
 		}
 		if value == "" {

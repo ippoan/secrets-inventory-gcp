@@ -147,7 +147,7 @@ func handleConvertPkcs8(
 		if err != nil {
 			log.Printf("CONVERT_PKCS8 source read failed actor=%q src=%q err=%v",
 				actor, sanitizeLogValue(srcName), err)
-			http.Error(w, "upstream error (gcp read)", http.StatusBadGateway)
+			http.Error(w, "upstream error (gcp read)", grpcToHTTPStatus(err))
 			return
 		}
 		if value == "" {

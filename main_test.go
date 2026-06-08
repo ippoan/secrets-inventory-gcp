@@ -16,6 +16,8 @@ import (
 	"cloud.google.com/go/iam/admin/apiv1/adminpb"
 	iampb "cloud.google.com/go/iam/apiv1/iampb"
 	"cloud.google.com/go/secretmanager/apiv1/secretmanagerpb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -386,6 +388,22 @@ func TestListSecretsUpstreamError(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("upstream error should 502, got %d", rec.Code)
+	}
+}
+
+// gRPC PermissionDenied は grpcToHTTPStatus 経由で 403 にマップされ、handler
+// から HTTP status として漏れ出ることを確認する (Refs #30)。これにより
+// 親 worker は Cloud Logging を見ずに「権限不足」と一次切り分けできる。
+func TestListSecretsPermissionDenied403(t *testing.T) {
+	mux := newMuxWithTest(
+		&fakeLister{err: status.Error(codes.PermissionDenied, "missing viewer role")},
+		&fakeIAMLister{}, &fakeActivityLister{}, "p", "topsecret")
+	req := httptest.NewRequest(http.MethodGet, "/list-secrets", nil)
+	req.Header.Set("X-Inventory-API-Key", "topsecret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("PermissionDenied should map to 403, got %d", rec.Code)
 	}
 }
 
