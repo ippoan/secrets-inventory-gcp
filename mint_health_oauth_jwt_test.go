@@ -238,7 +238,7 @@ func TestMintHealthOAuthJwt_CreateSecretError_502(t *testing.T) {
 	}
 }
 
-func TestMintHealthOAuthJwt_CreateSecretPermissionDenied_502(t *testing.T) {
+func TestMintHealthOAuthJwt_CreateSecretPermissionDenied_403(t *testing.T) {
 	getter := &fakeSecretValueGetter{values: map[string]string{
 		mintInputSecretName: fakeJwtSecret,
 	}}
@@ -251,8 +251,9 @@ func TestMintHealthOAuthJwt_CreateSecretPermissionDenied_502(t *testing.T) {
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, newMintRequest(t))
 
-	if rr.Code != http.StatusBadGateway {
-		t.Fatalf("got %d", rr.Code)
+	// PermissionDenied は grpcToHTTPStatus で 403 にマップされる (Refs #30)。
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("got %d, want 403", rr.Code)
 	}
 	if !strings.Contains(rr.Body.String(), "permission denied") {
 		t.Fatalf("expected permission denied hint, got %q", rr.Body.String())

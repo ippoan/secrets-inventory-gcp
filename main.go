@@ -807,7 +807,7 @@ func handleSetSADisabled(l iamLister, disabled bool) http.Handler {
 		saName := fmt.Sprintf("projects/-/serviceAccounts/%s", email)
 		if err := l.SetServiceAccountDisabled(ctx, saName, disabled); err != nil {
 			log.Printf("SA %s failed actor=%q target=%q err=%v", action, actor, target, err)
-			http.Error(w, "upstream error", http.StatusBadGateway)
+			http.Error(w, "upstream error", grpcToHTTPStatus(err))
 			return
 		}
 		log.Printf("SA %s ok actor=%q target=%q", action, actor, target)
@@ -951,7 +951,7 @@ func handleAddSecretVersion(l secretLister, projectID string) http.Handler {
 			if err != nil {
 				log.Printf("ADD_VERSION list-latest failed actor=%q target=%q err=%v",
 					actor, target, err)
-				http.Error(w, "upstream error", http.StatusBadGateway)
+				http.Error(w, "upstream error", grpcToHTTPStatus(err))
 				return
 			}
 			actualVersionId := shortName(latest) // "" if no versions yet
@@ -967,7 +967,7 @@ func handleAddSecretVersion(l secretLister, projectID string) http.Handler {
 		if err != nil {
 			log.Printf("ADD_VERSION upstream failed actor=%q target=%q err=%v",
 				actor, target, err)
-			http.Error(w, "upstream error", http.StatusBadGateway)
+			http.Error(w, "upstream error", grpcToHTTPStatus(err))
 			return
 		}
 		log.Printf("ADD_VERSION ok actor=%q target=%q new_version=%q",
@@ -993,8 +993,8 @@ func handleAddSecretVersion(l secretLister, projectID string) http.Handler {
 //   - `X-Inventory-API-Key` (required): shared secret 認証
 //   - `X-Actor-Email` (optional): 実操作者 email。actor audit log 用
 //   - `X-Fail-If-Exists` (optional, default "true"):
-//       - "true"  → 既存 name 衝突で 409、AddVersion は呼ばない
-//       - "false" → 既存 secret を再利用して AddVersion を続行 (新 version)
+//   - "true"  → 既存 name 衝突で 409、AddVersion は呼ばない
+//   - "false" → 既存 secret を再利用して AddVersion を続行 (新 version)
 //   - `X-Allow-Trailing-Whitespace` (optional, default "false"): 末尾に空白
 //     (newline/space/tab) を持つ値を許可するか。default は reject (400)。
 //     ippoan/auth-worker#208 の再発防止 (add-version と同じ規約)
@@ -1014,7 +1014,7 @@ func handleAddSecretVersion(l secretLister, projectID string) http.Handler {
 // 必要 IAM (Runtime SA):
 //   - `roles/secretmanager.secretCreator` (= secrets.create)
 //   - `roles/secretmanager.secretVersionAdder` (既存 /add-version 用、再利用)
-//   `secretmanager.admin` は付けない (= delete 不可、最小権限)。
+//     `secretmanager.admin` は付けない (= delete 不可、最小権限)。
 func handleCreateSecret(l secretLister, projectID string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -1094,7 +1094,7 @@ func handleCreateSecret(l secretLister, projectID string) http.Handler {
 		if err != nil {
 			log.Printf("CREATE_SECRET upstream failed actor=%q target=%q err=%v",
 				actor, target, err)
-			http.Error(w, "upstream error", http.StatusBadGateway)
+			http.Error(w, "upstream error", grpcToHTTPStatus(err))
 			return
 		}
 		if alreadyExists && failIfExists {
@@ -1109,7 +1109,7 @@ func handleCreateSecret(l secretLister, projectID string) http.Handler {
 		if err != nil {
 			log.Printf("CREATE_SECRET add-version failed actor=%q target=%q err=%v",
 				actor, target, err)
-			http.Error(w, "upstream error", http.StatusBadGateway)
+			http.Error(w, "upstream error", grpcToHTTPStatus(err))
 			return
 		}
 
@@ -1182,7 +1182,7 @@ func handleListSecrets(l secretLister, projectID string) http.Handler {
 		secrets, err := l.ListSecrets(ctx, parent)
 		if err != nil {
 			log.Printf("list secrets: %v", err)
-			http.Error(w, "upstream error", http.StatusBadGateway)
+			http.Error(w, "upstream error", grpcToHTTPStatus(err))
 			return
 		}
 
@@ -1253,7 +1253,7 @@ func handleListServiceAccounts(l iamLister, actL saActivityLister, projectID str
 
 		if saErr != nil {
 			log.Printf("list service accounts: %v", saErr)
-			http.Error(w, "upstream error", http.StatusBadGateway)
+			http.Error(w, "upstream error", grpcToHTTPStatus(saErr))
 			return
 		}
 
