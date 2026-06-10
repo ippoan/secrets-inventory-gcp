@@ -7,7 +7,7 @@ require (
 	cloud.google.com/go/iam v1.7.0
 	cloud.google.com/go/resourcemanager v1.10.7
 	cloud.google.com/go/secretmanager v1.20.0
-	github.com/ippoan/go-cloudrun-proxy v0.0.0-20260610121244-4c72978c3b52
+	github.com/ippoan/go-cloudrun-proxy v0.1.0
 	golang.org/x/crypto v0.51.0
 	google.golang.org/api v0.280.0
 	google.golang.org/genproto v0.0.0-20260319201613-d00831a3d3e7
