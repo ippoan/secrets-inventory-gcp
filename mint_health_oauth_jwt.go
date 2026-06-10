@@ -1,6 +1,8 @@
 package main
 
 import (
+	cloudrunproxy "github.com/ippoan/go-cloudrun-proxy"
+
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -88,7 +90,7 @@ func handleMintHealthOAuthJwt(
 		jwtSecret, err := getter.Get(ctx, mintInputSecretName)
 		if err != nil {
 			log.Printf("MINT_HEALTH_OAUTH_JWT read JWT_SECRET failed actor=%q err=%v", actor, err)
-			http.Error(w, "upstream error", grpcToHTTPStatus(err))
+			http.Error(w, "upstream error", cloudrunproxy.StatusFromGRPC(err))
 			return
 		}
 		if jwtSecret == "" {
@@ -122,11 +124,11 @@ func handleMintHealthOAuthJwt(
 			// ここに来るのは真の上流エラー。
 			if status.Code(err) == codes.PermissionDenied {
 				log.Printf("MINT_HEALTH_OAUTH_JWT create permission denied actor=%q err=%v", actor, err)
-				http.Error(w, "upstream permission denied (need secretCreator role on runtime SA)", grpcToHTTPStatus(err))
+				http.Error(w, "upstream permission denied (need secretCreator role on runtime SA)", cloudrunproxy.StatusFromGRPC(err))
 				return
 			}
 			log.Printf("MINT_HEALTH_OAUTH_JWT create failed actor=%q err=%v", actor, err)
-			http.Error(w, "upstream error", grpcToHTTPStatus(err))
+			http.Error(w, "upstream error", cloudrunproxy.StatusFromGRPC(err))
 			return
 		}
 
@@ -136,7 +138,7 @@ func handleMintHealthOAuthJwt(
 		_ = token
 		if err != nil {
 			log.Printf("MINT_HEALTH_OAUTH_JWT add-version failed actor=%q err=%v", actor, err)
-			http.Error(w, "upstream error", grpcToHTTPStatus(err))
+			http.Error(w, "upstream error", cloudrunproxy.StatusFromGRPC(err))
 			return
 		}
 

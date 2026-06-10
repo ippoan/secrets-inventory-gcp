@@ -1,6 +1,8 @@
 package main
 
 import (
+	cloudrunproxy "github.com/ippoan/go-cloudrun-proxy"
+
 	"context"
 	"crypto/x509"
 	"encoding/json"
@@ -147,7 +149,7 @@ func handleConvertPkcs8(
 		if err != nil {
 			log.Printf("CONVERT_PKCS8 source read failed actor=%q src=%q err=%v",
 				actor, sanitizeLogValue(srcName), err)
-			http.Error(w, "upstream error (gcp read)", grpcToHTTPStatus(err))
+			http.Error(w, "upstream error (gcp read)", cloudrunproxy.StatusFromGRPC(err))
 			return
 		}
 		if value == "" {

@@ -1,6 +1,8 @@
 package main
 
 import (
+	cloudrunproxy "github.com/ippoan/go-cloudrun-proxy"
+
 	"context"
 	"encoding/json"
 	"fmt"
@@ -190,7 +192,7 @@ func handleSyncFromGcp(
 		if err != nil {
 			log.Printf("SYNC_FROM_GCP source read failed actor=%q source=%q err=%v",
 				actor, source, err)
-			http.Error(w, "upstream error (gcp read)", grpcToHTTPStatus(err))
+			http.Error(w, "upstream error (gcp read)", cloudrunproxy.StatusFromGRPC(err))
 			return
 		}
 		if value == "" {
