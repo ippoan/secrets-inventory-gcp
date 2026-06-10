@@ -44,8 +44,8 @@ github.com/googleapis/enterprise-certificate-proxy v0.3.15 h1:xolVQTEXusUcAA5Ugt
 github.com/googleapis/enterprise-certificate-proxy v0.3.15/go.mod h1:vqVt9yG9480NtzREnTlmGSBmFrA+bzb0yl0TxoBQXOg=
 github.com/googleapis/gax-go/v2 v2.22.0 h1:PjIWBpgGIVKGoCXuiCoP64altEJCj3/Ei+kSU5vlZD4=
 github.com/googleapis/gax-go/v2 v2.22.0/go.mod h1:irWBbALSr0Sk3qlqb9SyJ1h68WjgeFuiOzI4Rqw5+aY=
-github.com/ippoan/go-cloudrun-proxy v0.0.0-20260610121244-4c72978c3b52 h1:Z0hQJxzScHJ3TAjdazUGq9y0uBOyFxxsu1n3fMVVWdA=
-github.com/ippoan/go-cloudrun-proxy v0.0.0-20260610121244-4c72978c3b52/go.mod h1:0l813Xz9eLd0nYC6HMbBfZxChHpw9tmngtlm6l54Qns=
+github.com/ippoan/go-cloudrun-proxy v0.1.0 h1:TeyRgnt+EJeZYkJiP4TKDFdzgE4sHPHKKbJakv44d0k=
+github.com/ippoan/go-cloudrun-proxy v0.1.0/go.mod h1:0l813Xz9eLd0nYC6HMbBfZxChHpw9tmngtlm6l54Qns=
 github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 h1:GFCKgmp0tecUJ0sJuv4pzYCqS9+RGSn52M3FUwPs+uo=
 github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10/go.mod h1:t/avpk3KcrXxUnYOhZhMXJlSEyie6gQbtLq5NM3loB8=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
