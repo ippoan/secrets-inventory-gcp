@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	cloudrunproxy "github.com/ippoan/go-cloudrun-proxy"
 
 	"cloud.google.com/go/compute/metadata"
 	iamadmin "cloud.google.com/go/iam/admin/apiv1"
@@ -123,8 +124,8 @@ type createSecretResponse struct {
 }
 
 func main() {
-	projectID := mustEnv("GCP_PROJECT_ID")
-	apiKey := mustEnv("INVENTORY_API_KEY")
+	projectID := cloudrunproxy.MustEnv("GCP_PROJECT_ID")
+	apiKey := cloudrunproxy.MustEnv("INVENTORY_API_KEY")
 	// CF / GH 関連 env は worker (`secrets-inventory`) の
 	// `CF_API_TOKEN` / `GITHUB_PAT` Secrets Store binding を本 proxy に集約
 	// するための optional 設定 (Refs ippoan/secrets-inventory#45)。
@@ -251,14 +252,6 @@ func resolveRuntimeSA(ctx context.Context) string {
 		return ""
 	}
 	return strings.TrimSpace(email)
-}
-
-func mustEnv(key string) string {
-	v := os.Getenv(key)
-	if v == "" {
-		log.Fatalf("env %s is required", key)
-	}
-	return v
 }
 
 // secretLister は *secretmanager.Client の必要部分だけを切り出した interface。
@@ -603,7 +596,7 @@ func newMuxWith(
 	// `/healthz` は Cloud Run / GFE の reserved path 扱いで Google edge が直接
 	// 404 HTML を返してしまう (実 staging で再現)。`/health` に rename して
 	// app に届くようにする。
-	mux.HandleFunc("/health", handleHealth)
+	mux.HandleFunc("/health", cloudrunproxy.HandleHealth("secrets-inventory-gcp"))
 	mux.Handle("/list-secrets", requireAPIKey(apiKey, handleListSecrets(l, projectID)))
 	mux.Handle("/list-service-accounts", requireAPIKey(apiKey, handleListServiceAccounts(iamL, actL, projectID)))
 	mux.Handle("/sa-disable", requireAPIKey(apiKey, handleSetSADisabled(iamL, true)))
@@ -752,21 +745,12 @@ func cfServiceTokenSubDispatcher(getter secretValueGetter, cfg cfConfig, http_ h
 	})
 }
 
-func handleHealth(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write([]byte(`{"ok":true,"service":"secrets-inventory-gcp"}`))
-}
-
+// requireAPIKey は共有 lib の constant-time + fail-closed 認証に header 名だけ
+// bind する薄い wrapper (Refs ippoan/go-cloudrun-proxy#1)。401 body は lib の
+// 固定 JSON `{"error":"unauthorized"}` になる (旧 plain text から変更、caller は
+// status code のみ参照)。
 func requireAPIKey(expected string, next http.Handler) http.Handler {
-	expectedBytes := []byte(expected)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got := r.Header.Get("X-Inventory-API-Key")
-		if subtle.ConstantTimeCompare([]byte(got), expectedBytes) != 1 {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+	return cloudrunproxy.RequireAPIKey("X-Inventory-API-Key", expected, next)
 }
 
 // handleSetSADisabled は POST /sa-disable / POST /sa-enable のハンドラ。
@@ -807,7 +791,7 @@ func handleSetSADisabled(l iamLister, disabled bool) http.Handler {
 		saName := fmt.Sprintf("projects/-/serviceAccounts/%s", email)
 		if err := l.SetServiceAccountDisabled(ctx, saName, disabled); err != nil {
 			log.Printf("SA %s failed actor=%q target=%q err=%v", action, actor, target, err)
-			http.Error(w, "upstream error", grpcToHTTPStatus(err))
+			http.Error(w, "upstream error", cloudrunproxy.StatusFromGRPC(err))
 			return
 		}
 		log.Printf("SA %s ok actor=%q target=%q", action, actor, target)
@@ -951,7 +935,7 @@ func handleAddSecretVersion(l secretLister, projectID string) http.Handler {
 			if err != nil {
 				log.Printf("ADD_VERSION list-latest failed actor=%q target=%q err=%v",
 					actor, target, err)
-				http.Error(w, "upstream error", grpcToHTTPStatus(err))
+				http.Error(w, "upstream error", cloudrunproxy.StatusFromGRPC(err))
 				return
 			}
 			actualVersionId := shortName(latest) // "" if no versions yet
@@ -967,7 +951,7 @@ func handleAddSecretVersion(l secretLister, projectID string) http.Handler {
 		if err != nil {
 			log.Printf("ADD_VERSION upstream failed actor=%q target=%q err=%v",
 				actor, target, err)
-			http.Error(w, "upstream error", grpcToHTTPStatus(err))
+			http.Error(w, "upstream error", cloudrunproxy.StatusFromGRPC(err))
 			return
 		}
 		log.Printf("ADD_VERSION ok actor=%q target=%q new_version=%q",
@@ -1094,7 +1078,7 @@ func handleCreateSecret(l secretLister, projectID string) http.Handler {
 		if err != nil {
 			log.Printf("CREATE_SECRET upstream failed actor=%q target=%q err=%v",
 				actor, target, err)
-			http.Error(w, "upstream error", grpcToHTTPStatus(err))
+			http.Error(w, "upstream error", cloudrunproxy.StatusFromGRPC(err))
 			return
 		}
 		if alreadyExists && failIfExists {
@@ -1109,7 +1093,7 @@ func handleCreateSecret(l secretLister, projectID string) http.Handler {
 		if err != nil {
 			log.Printf("CREATE_SECRET add-version failed actor=%q target=%q err=%v",
 				actor, target, err)
-			http.Error(w, "upstream error", grpcToHTTPStatus(err))
+			http.Error(w, "upstream error", cloudrunproxy.StatusFromGRPC(err))
 			return
 		}
 
@@ -1182,7 +1166,7 @@ func handleListSecrets(l secretLister, projectID string) http.Handler {
 		secrets, err := l.ListSecrets(ctx, parent)
 		if err != nil {
 			log.Printf("list secrets: %v", err)
-			http.Error(w, "upstream error", grpcToHTTPStatus(err))
+			http.Error(w, "upstream error", cloudrunproxy.StatusFromGRPC(err))
 			return
 		}
 
@@ -1253,7 +1237,7 @@ func handleListServiceAccounts(l iamLister, actL saActivityLister, projectID str
 
 		if saErr != nil {
 			log.Printf("list service accounts: %v", saErr)
-			http.Error(w, "upstream error", grpcToHTTPStatus(saErr))
+			http.Error(w, "upstream error", cloudrunproxy.StatusFromGRPC(saErr))
 			return
 		}
 
