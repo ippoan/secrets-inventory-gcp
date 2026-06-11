@@ -63,19 +63,35 @@ type ghPublicKey struct {
 }
 
 // ghConfig は GH endpoint 群が共有する設定。
-// org / tokenSecret が **すべて** non-empty なら configured。1 つでも空なら
-// 未設定扱いで handler が 503 を返す (cf.go の cfConfig と同方針)。
+// org + (PAT or App auth) が揃っていれば configured。揃わなければ未設定扱いで
+// handler が 503 を返す (cf.go の cfConfig と同方針)。
 type ghConfig struct {
 	org         string
 	tokenSecret string
 	// extraOrgs は default org 以外への書込を許可する org → PAT secret 名の
 	// allowlist (env `GH_EXTRA_ORGS`、Refs #49)。org ごとに **専用 PAT** を
 	// Secret Manager 上で分離する (= ippoan 用 PAT に他 org 権限を足さない)。
+	// App mode (下記) が有効な場合は使われない fallback。
 	extraOrgs map[string]string
+	// app が configured なら GitHub App installation token mode (Refs #51)。
+	// PAT を一切使わず、App が install されている org すべてに書ける
+	// (installation 集合が実質の allowlist)。appCache は ghConfig が値 copy で
+	// 引き回されるため pointer 共有。
+	app      ghAppConfig
+	appCache *ghAppTokenCache
 }
 
 func (c ghConfig) configured() bool {
-	return c.org != "" && c.tokenSecret != ""
+	return c.org != "" && (c.tokenSecret != "" || c.app.configured())
+}
+
+// token は実効 org 用の GitHub API token を返す。App mode なら installation
+// token (cache 越し)、そうでなければ PAT を Secret Manager から取る。
+func (c ghConfig) token(ctx context.Context, getter secretValueGetter, http_ httpDoer) (string, error) {
+	if c.app.configured() && c.appCache != nil {
+		return c.appCache.tokenForOrg(ctx, c.org, c.app, getter, http_)
+	}
+	return getter.Get(ctx, c.tokenSecret)
 }
 
 // ghOrgPattern は GitHub org (login) 名の制約 (英数字 + ハイフン、先頭末尾は
@@ -119,12 +135,23 @@ func parseGhExtraOrgs(s string) (map[string]string, error) {
 
 // resolve は `?org=` / `?gh_org=` で要求された org の実効 config を返す。
 //   - 空 or default org → 受領 config そのまま (backward compat)
+//   - App mode 有効 → 形式が正しい任意の org を受理 (install 有無は
+//     installation lookup = GitHub 側が判定。Refs #51)
 //   - allowlist (extraOrgs) 内 → その org 専用 PAT に差し替えた config
 //   - それ以外 → error (= caller が 400 を返す。org 名は secret ではないが
 //     upstream エラー同様 response には固定文言のみ)
 func (c ghConfig) resolve(org string) (ghConfig, error) {
 	if org == "" || org == c.org {
 		return c, nil
+	}
+	if !ghOrgPattern.MatchString(org) {
+		return ghConfig{}, fmt.Errorf("invalid org %q", org)
+	}
+	if c.app.configured() {
+		out := c
+		out.org = org
+		out.tokenSecret = "" // App mode では PAT を使わない
+		return out, nil
 	}
 	if tokenSecret, ok := c.extraOrgs[org]; ok {
 		return ghConfig{org: org, tokenSecret: tokenSecret}, nil
@@ -153,7 +180,7 @@ func handleGhList(getter secretValueGetter, cfg ghConfig, http_ httpDoer) http.H
 		ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
 		defer cancel()
 
-		token, err := getter.Get(ctx, cfg.tokenSecret)
+		token, err := cfg.token(ctx, getter, http_)
 		if err != nil {
 			log.Printf("GH_LIST token fetch failed: %v", err)
 			http.Error(w, "upstream error", http.StatusBadGateway)
@@ -299,7 +326,7 @@ func handleGhPut(getter secretValueGetter, cfg ghConfig, http_ httpDoer) http.Ha
 		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 		defer cancel()
 
-		token, err := getter.Get(ctx, cfg.tokenSecret)
+		token, err := cfg.token(ctx, getter, http_)
 		if err != nil {
 			log.Printf("GH_PUT token fetch failed actor=%q target=%q err=%v", actor, target, err)
 			http.Error(w, "upstream error", http.StatusBadGateway)

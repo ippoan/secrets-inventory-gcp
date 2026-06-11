@@ -271,7 +271,7 @@ func propagateToGh(
 	actor string,
 ) syncTargetResult {
 	target := sanitizeLogValue(name)
-	token, err := getter.Get(ctx, cfg.tokenSecret)
+	token, err := cfg.token(ctx, getter, http_)
 	if err != nil {
 		log.Printf("SYNC_GH token fetch failed actor=%q target=%q err=%v", actor, target, err)
 		return syncTargetResult{Status: "fail", Error: "gh token fetch"}
