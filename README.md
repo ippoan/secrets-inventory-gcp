@@ -52,6 +52,27 @@ GCP Service Account の JSON key (~2KB) は Cloudflare Secrets Store の 1024 by
 
 `/list-secrets` のレスポンスは Worker 側の `SecretMetadata[]` 形にそのまま map できる shape (`name` は `projects/.../secrets/` prefix を剥がした短縮名)。
 
+read endpoint の他に write/proxy endpoint (`/add-version` / `/create-secret` /
+`/cf/secrets*` / `/gh/secrets*` / `/sync-from-gcp/:name` 等) を持つ。全 endpoint と
+最小権限の方針は [`CLAUDE.md`](CLAUDE.md) を参照。
+
+### GitHub org secret 書込の認証 (App mode / 別 org 対応)
+
+`/gh/secrets*` と `/sync-from-gcp` の `?gh_org=` は **default org 以外**にも書ける。
+認証 backend は 2 mode (Refs #51 / #49):
+
+- **GitHub App installation token mode (推奨)** — env `GH_APP_ID_SECRET_NAME` +
+  `GH_APP_PRIVATE_KEY_SECRET_NAME` (Secret Manager の secret 名)。App JWT →
+  installation token (1h、org 別 cache) で、**App が install された org すべて**に
+  書ける = per-org PAT 不要。App 側に Organization permissions → Secrets: Read and
+  write が必要。鍵 PEM は PKCS#1 / PKCS#8 両対応。
+- **PAT mode (fallback)** — `GH_TOKEN_SECRET_NAME` (default org) + `GH_EXTRA_ORGS`
+  (comma 区切り `org=tokenSecretName` allowlist、org ごとに専用 PAT)。App mode 無効時。
+
+新 org オンボードは「App を install + permission 承認 → `sync_from_gcp { gh_org }` で
+配布 → caller は named secret 明示渡し」の 3 step (`secrets: inherit` はクロス org で
+効かない)。詳細は親 repo `ippoan/secrets-inventory` README / `ci-workflows` CLAUDE.md。
+
 ## GCP 側 setup (one-time)
 
 詳細は [issue #1](https://github.com/ippoan/secrets-inventory-gcp/issues/1) を参照。要点:
