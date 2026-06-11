@@ -1,0 +1,16 @@
+name: skills-check
+
+# secrets-inventory-gcp-map skill が構造変化に追従しているか PR diff で検査する
+# (ci-workflows#118 / claude-skills#59 Wave 3)。enforce=warn (default)。
+# map-check + dependency-check (新規依存 vs knowledge/standards/libs) が走る。
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  skills-check:
+    uses: ippoan/ci-workflows/.github/workflows/skills-check.yml@main
