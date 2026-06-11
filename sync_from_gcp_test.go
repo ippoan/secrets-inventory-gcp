@@ -652,3 +652,98 @@ func TestParseCsvQuery(t *testing.T) {
 		}
 	}
 }
+
+// ---- gh_org (per-request org 指定、Refs #49) ----
+
+func newSyncExtraOrgTestMux(getter secretValueGetter, doer httpDoer) *http.ServeMux {
+	return newMuxWith(
+		&fakeLister{}, &fakeIAMLister{}, &fakeActivityLister{},
+		getter,
+		nil,
+		cfConfig{accountID: "acc", storeID: "store", tokenSecret: "cf-token"},
+		ghConfig{org: "ippoan", tokenSecret: "gh-token",
+			extraOrgs: map[string]string{"ohishi-exp": "gh-token-ohishi-exp"}},
+		doer,
+		"p", "k",
+	)
+}
+
+func TestSyncFromGcp_GhOrg_NotAllowed(t *testing.T) {
+	mux := newSyncExtraOrgTestMux(&fakeSecretValueGetter{}, &fakeHTTPDoer{})
+	req := newSyncRequest(t, "/sync-from-gcp/CI_APP_ID?targets=gh&gh_org=unknown-org")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSyncFromGcp_GhOrg_RequiresGhTarget(t *testing.T) {
+	mux := newSyncExtraOrgTestMux(&fakeSecretValueGetter{}, &fakeHTTPDoer{})
+	req := newSyncRequest(t, "/sync-from-gcp/CI_APP_ID?targets=cf&gh_org=ohishi-exp")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSyncFromGcp_GhOrg_Success_PropagatesToExtraOrg(t *testing.T) {
+	recipientPub, recipientPriv, pubB64 := genGhPubkey(t)
+
+	doer := &fakeHTTPDoer{}
+	doer.respond("GET https://api.github.com/orgs/ohishi-exp/actions/secrets/CI_APP_PRIVATE_KEY",
+		http.StatusNotFound, "")
+	doer.respond("GET https://api.github.com/orgs/ohishi-exp/actions/secrets/public-key",
+		http.StatusOK, `{"key_id":"kid-2","key":"`+pubB64+`"}`)
+	doer.respond("PUT https://api.github.com/orgs/ohishi-exp/actions/secrets/CI_APP_PRIVATE_KEY",
+		http.StatusCreated, "")
+	getter := &fakeSecretValueGetter{values: map[string]string{
+		"CI_APP_PRIVATE_KEY_PKCS8": "-----BEGIN PRIVATE KEY-----fake",
+		"gh-token-ohishi-exp":      "tok-ohishi",
+	}}
+
+	mux := newSyncExtraOrgTestMux(getter, doer)
+	req := newSyncRequest(t,
+		"/sync-from-gcp/CI_APP_PRIVATE_KEY_PKCS8?targets=gh&gh_org=ohishi-exp&gh_name=CI_APP_PRIVATE_KEY")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp syncFromGcpResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if r, ok := resp.Results["gh"]; !ok || r.Status != "ok" || !r.Created {
+		t.Fatalf("gh result: %+v", r)
+	}
+	// org 専用 PAT が全 GitHub call で使われている (ippoan 用 PAT に
+	// fallback していない) こと。
+	for _, c := range doer.calls {
+		if got := c.Header.Get("Authorization"); got != "Bearer tok-ohishi" {
+			t.Errorf("%s %s Authorization = %q", c.Method, c.URL, got)
+		}
+	}
+	// 値の round-trip (sealed box が ohishi-exp の鍵で開く)。
+	var putBody []byte
+	for _, c := range doer.calls {
+		if c.Method == http.MethodPut {
+			putBody, _ = io.ReadAll(c.Body)
+		}
+	}
+	var put struct {
+		EncryptedValue string `json:"encrypted_value"`
+	}
+	if err := json.Unmarshal(putBody, &put); err != nil {
+		t.Fatal(err)
+	}
+	sealed, _ := base64.StdEncoding.DecodeString(put.EncryptedValue)
+	opened, ok := box.OpenAnonymous(nil, sealed, recipientPub, recipientPriv)
+	if !ok {
+		t.Fatal("could not open sealed box")
+	}
+	if string(opened) != "-----BEGIN PRIVATE KEY-----fake" {
+		t.Fatalf("plaintext mismatch")
+	}
+}

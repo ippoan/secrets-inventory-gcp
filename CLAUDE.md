@@ -117,6 +117,11 @@ PR テンプレートは `.github/pull_request_template.md` で `Refs` を強制
     (5 分 TTL cache)。CF API は本 proxy 側で talking、worker は持たない
   - **GitHub org secrets proxy (`/gh/secrets*`)** — 同 #45。
     `GET /gh/secrets` (list)、`PUT /gh/secrets/{name}` (create/update)。
+    `?org=` (および `/sync-from-gcp` の `?gh_org=`) で **`GH_EXTRA_ORGS`
+    allowlist 内の別 org** に切替可能 (Refs #49、例: `ohishi-exp`)。env 形式は
+    comma 区切りの `org=tokenSecretName` で、**org ごとに専用 PAT** を Secret
+    Manager に分離する (ippoan 用 PAT に他 org 権限を足さない)。未指定は従来
+    どおり `GITHUB_ORG`、allowlist 外は 400。
     GitHub Actions org secret 必須の **libsodium sealed box encrypt
     (Curve25519 + XSalsa20-Poly1305 + blake2b nonce) は proxy 側で実行**
     し、worker は素の value を送る (= worker から libsodium 依存を排除)。
