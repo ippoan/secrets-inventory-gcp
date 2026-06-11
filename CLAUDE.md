@@ -117,11 +117,19 @@ PR テンプレートは `.github/pull_request_template.md` で `Refs` を強制
     (5 分 TTL cache)。CF API は本 proxy 側で talking、worker は持たない
   - **GitHub org secrets proxy (`/gh/secrets*`)** — 同 #45。
     `GET /gh/secrets` (list)、`PUT /gh/secrets/{name}` (create/update)。
-    `?org=` (および `/sync-from-gcp` の `?gh_org=`) で **`GH_EXTRA_ORGS`
-    allowlist 内の別 org** に切替可能 (Refs #49、例: `ohishi-exp`)。env 形式は
-    comma 区切りの `org=tokenSecretName` で、**org ごとに専用 PAT** を Secret
-    Manager に分離する (ippoan 用 PAT に他 org 権限を足さない)。未指定は従来
-    どおり `GITHUB_ORG`、allowlist 外は 400。
+    `?org=` (および `/sync-from-gcp` の `?gh_org=`) で別 org に切替可能。
+    認証 backend は 2 mode (Refs #49 / #51):
+    - **GitHub App installation token mode (推奨)** — env
+      `GH_APP_ID_SECRET_NAME` + `GH_APP_PRIVATE_KEY_SECRET_NAME` (両方とも
+      Secret Manager の secret 名、例: `CI_APP_ID` / `CI_APP_PRIVATE_KEY`)。
+      App JWT → installation token (1h、org 別 cache) で、**App が install
+      されている org すべて**に書ける = per-org PAT 不要。App 側に
+      Organization permissions → Secrets: Read and write が必要 (無いと
+      secrets API が 403 "Resource not accessible by integration")
+    - **PAT mode (fallback)** — `GH_TOKEN_SECRET_NAME` (default org) +
+      `GH_EXTRA_ORGS` (comma 区切り `org=tokenSecretName` の allowlist、
+      org ごとに専用 PAT を分離)。App mode 有効時は使われない
+    未指定は従来どおり `GITHUB_ORG`、解決できない org は 400。
     GitHub Actions org secret 必須の **libsodium sealed box encrypt
     (Curve25519 + XSalsa20-Poly1305 + blake2b nonce) は proxy 側で実行**
     し、worker は素の value を送る (= worker から libsodium 依存を排除)。

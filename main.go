@@ -147,6 +147,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid GH_EXTRA_ORGS: %v", err)
 	}
+	// GitHub App installation token mode (Refs #51)。両方設定すると PAT を
+	// 使わず App token で任意の install 済み org に書ける。秘密鍵は Secret
+	// Manager 上の secret 名を env で渡す (値そのものは env に焼かない)。
+	ghApp := ghAppConfig{
+		appIDSecret: os.Getenv("GH_APP_ID_SECRET_NAME"),
+		keySecret:   os.Getenv("GH_APP_PRIVATE_KEY_SECRET_NAME"),
+	}
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -219,7 +226,8 @@ func main() {
 		valueGetter,
 		srcGetter,
 		cfConfig{accountID: cfAccountID, storeID: cfStoreID, tokenSecret: cfTokenSecret},
-		ghConfig{org: ghOrg, tokenSecret: ghTokenSecret, extraOrgs: ghExtraOrgs},
+		ghConfig{org: ghOrg, tokenSecret: ghTokenSecret, extraOrgs: ghExtraOrgs,
+			app: ghApp, appCache: newGhAppTokenCache()},
 		http.DefaultClient,
 		projectID,
 		apiKey,
