@@ -140,6 +140,13 @@ func main() {
 	cfTokenSecret := os.Getenv("CF_TOKEN_SECRET_NAME")
 	ghOrg := os.Getenv("GITHUB_ORG")
 	ghTokenSecret := os.Getenv("GH_TOKEN_SECRET_NAME")
+	// default org 以外への書込 allowlist (Refs #49)。形式は comma 区切りの
+	// `org=tokenSecretName`。optional だが、設定するなら malformed は起動時に
+	// fail-loud する (黙って一部 org が無効になるのを避ける)。
+	ghExtraOrgs, err := parseGhExtraOrgs(os.Getenv("GH_EXTRA_ORGS"))
+	if err != nil {
+		log.Fatalf("invalid GH_EXTRA_ORGS: %v", err)
+	}
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -212,7 +219,7 @@ func main() {
 		valueGetter,
 		srcGetter,
 		cfConfig{accountID: cfAccountID, storeID: cfStoreID, tokenSecret: cfTokenSecret},
-		ghConfig{org: ghOrg, tokenSecret: ghTokenSecret},
+		ghConfig{org: ghOrg, tokenSecret: ghTokenSecret, extraOrgs: ghExtraOrgs},
 		http.DefaultClient,
 		projectID,
 		apiKey,

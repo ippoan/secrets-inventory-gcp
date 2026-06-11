@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -62,15 +63,73 @@ type ghPublicKey struct {
 }
 
 // ghConfig は GH endpoint 群が共有する設定。
-// 2 field が **すべて** non-empty なら configured。1 つでも空なら未設定扱いで
-// handler が 503 を返す (cf.go の cfConfig と同方針)。
+// org / tokenSecret が **すべて** non-empty なら configured。1 つでも空なら
+// 未設定扱いで handler が 503 を返す (cf.go の cfConfig と同方針)。
 type ghConfig struct {
 	org         string
 	tokenSecret string
+	// extraOrgs は default org 以外への書込を許可する org → PAT secret 名の
+	// allowlist (env `GH_EXTRA_ORGS`、Refs #49)。org ごとに **専用 PAT** を
+	// Secret Manager 上で分離する (= ippoan 用 PAT に他 org 権限を足さない)。
+	extraOrgs map[string]string
 }
 
 func (c ghConfig) configured() bool {
 	return c.org != "" && c.tokenSecret != ""
+}
+
+// ghOrgPattern は GitHub org (login) 名の制約 (英数字 + ハイフン、先頭末尾は
+// 英数字、39 文字以内) で query injection を弾く。
+var ghOrgPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$`)
+
+// parseGhExtraOrgs は env `GH_EXTRA_ORGS` (comma 区切りの `org=tokenSecretName`、
+// 例: `ohishi-exp=gh-secrets-inventory-org-secrets-write-ohishi-exp`) を
+// allowlist map に変換する。空文字列は空 map (= extra org なし)。malformed
+// entry は error (= main が起動時に fail-loud する。誤設定のまま黙って
+// 一部 org だけ無効、を避ける)。
+func parseGhExtraOrgs(s string) (map[string]string, error) {
+	out := map[string]string{}
+	if strings.TrimSpace(s) == "" {
+		return out, nil
+	}
+	for _, entry := range strings.Split(s, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		org, tokenSecret, found := strings.Cut(entry, "=")
+		if !found {
+			return nil, fmt.Errorf("entry %q: expected org=tokenSecretName", entry)
+		}
+		org = strings.TrimSpace(org)
+		tokenSecret = strings.TrimSpace(tokenSecret)
+		if !ghOrgPattern.MatchString(org) {
+			return nil, fmt.Errorf("entry %q: invalid org name", entry)
+		}
+		if !secretNamePattern.MatchString(tokenSecret) {
+			return nil, fmt.Errorf("entry %q: invalid token secret name", entry)
+		}
+		if _, dup := out[org]; dup {
+			return nil, fmt.Errorf("entry %q: duplicate org", entry)
+		}
+		out[org] = tokenSecret
+	}
+	return out, nil
+}
+
+// resolve は `?org=` / `?gh_org=` で要求された org の実効 config を返す。
+//   - 空 or default org → 受領 config そのまま (backward compat)
+//   - allowlist (extraOrgs) 内 → その org 専用 PAT に差し替えた config
+//   - それ以外 → error (= caller が 400 を返す。org 名は secret ではないが
+//     upstream エラー同様 response には固定文言のみ)
+func (c ghConfig) resolve(org string) (ghConfig, error) {
+	if org == "" || org == c.org {
+		return c, nil
+	}
+	if tokenSecret, ok := c.extraOrgs[org]; ok {
+		return ghConfig{org: org, tokenSecret: tokenSecret}, nil
+	}
+	return ghConfig{}, fmt.Errorf("org %q not in allowlist", org)
 }
 
 // ghNamePattern は GitHub Actions secret name の制約 (= `[A-Z_][A-Z0-9_]*`)
@@ -83,6 +142,14 @@ func handleGhList(getter secretValueGetter, cfg ghConfig, http_ httpDoer) http.H
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		// `?org=` で allowlist 内の別 org を選択できる (Refs #49)。
+		resolved, err := cfg.resolve(r.URL.Query().Get("org"))
+		if err != nil {
+			log.Printf("GH_LIST org rejected: %v", err)
+			http.Error(w, "org not allowed", http.StatusBadRequest)
+			return
+		}
+		cfg = resolved
 		ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
 		defer cancel()
 
@@ -173,6 +240,14 @@ func handleGhPut(getter secretValueGetter, cfg ghConfig, http_ httpDoer) http.Ha
 			http.Error(w, "invalid name", http.StatusBadRequest)
 			return
 		}
+		// `?org=` で allowlist 内の別 org を選択できる (Refs #49)。
+		resolved, err := cfg.resolve(r.URL.Query().Get("org"))
+		if err != nil {
+			log.Printf("GH_PUT org rejected: %v", err)
+			http.Error(w, "org not allowed", http.StatusBadRequest)
+			return
+		}
+		cfg = resolved
 
 		actor := sanitizeLogValue(r.Header.Get("X-Actor-Email"))
 		target := sanitizeLogValue(name)
@@ -218,8 +293,8 @@ func handleGhPut(getter secretValueGetter, cfg ghConfig, http_ httpDoer) http.Ha
 			return
 		}
 
-		log.Printf("GH_PUT requested actor=%q target=%q fail_if_exists=%v visibility=%q value_bytes=%d",
-			actor, target, failIfExists, visibility, len(body.Value))
+		log.Printf("GH_PUT requested actor=%q org=%q target=%q fail_if_exists=%v visibility=%q value_bytes=%d",
+			actor, sanitizeLogValue(cfg.org), target, failIfExists, visibility, len(body.Value))
 
 		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 		defer cancel()

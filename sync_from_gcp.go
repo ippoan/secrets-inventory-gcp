@@ -131,6 +131,24 @@ func handleSyncFromGcp(
 			return
 		}
 
+		// `?gh_org=` で allowlist (GH_EXTRA_ORGS) 内の別 org に伝播できる
+		// (Refs #49)。空なら従来どおり default org (GITHUB_ORG)。
+		ghOrg := q.Get("gh_org")
+		if ghOrg != "" && !wantGh {
+			http.Error(w, "gh_org requires targets to include gh", http.StatusBadRequest)
+			return
+		}
+		effGhCfg := ghCfg
+		if wantGh {
+			resolved, err := ghCfg.resolve(ghOrg)
+			if err != nil {
+				log.Printf("SYNC_FROM_GCP gh_org rejected: %v", err)
+				http.Error(w, "gh_org not allowed", http.StatusBadRequest)
+				return
+			}
+			effGhCfg = resolved
+		}
+
 		ghName := q.Get("gh_name")
 		if ghName == "" {
 			ghName = srcName
@@ -177,9 +195,9 @@ func handleSyncFromGcp(
 
 		actor := sanitizeLogValue(r.Header.Get("X-Actor-Email"))
 		source := sanitizeLogValue(srcName)
-		log.Printf("SYNC_FROM_GCP requested actor=%q source=%q targets=%q gh_name=%q cf_name=%q",
+		log.Printf("SYNC_FROM_GCP requested actor=%q source=%q targets=%q gh_org=%q gh_name=%q cf_name=%q",
 			actor, source, sanitizeLogValue(rawTargets),
-			sanitizeLogValue(ghName), sanitizeLogValue(cfName))
+			sanitizeLogValue(effGhCfg.org), sanitizeLogValue(ghName), sanitizeLogValue(cfName))
 
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
@@ -206,7 +224,7 @@ func handleSyncFromGcp(
 
 		if wantGh {
 			r := propagateToGh(ctx, ghName, value, visibility, failIfExists,
-				ghCfg, getter, httpClient, actor)
+				effGhCfg, getter, httpClient, actor)
 			results["gh"] = r
 			if r.Status != "ok" {
 				ok = false
