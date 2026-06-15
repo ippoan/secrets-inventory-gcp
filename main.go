@@ -663,6 +663,12 @@ func newMuxWith(
 		handleGhPut(valueGetter, ghCfg, httpClient))))
 	mux.Handle("/gh/secrets", requireAPIKey(apiKey, requireGhConfigured(ghCfg,
 		handleGhList(valueGetter, ghCfg, httpClient))))
+	// GitHub Actions repo variables (平文 config、secret ではない)。
+	// `/gh/variables/{name}` = upsert (PUT)、`/gh/variables` = list (GET)。
+	mux.Handle("/gh/variables/", requireAPIKey(apiKey, requireGhConfigured(ghCfg,
+		handleGhVariablePut(valueGetter, ghCfg, httpClient))))
+	mux.Handle("/gh/variables", requireAPIKey(apiKey, requireGhConfigured(ghCfg,
+		handleGhVariablesList(valueGetter, ghCfg, httpClient))))
 	return mux
 }
 

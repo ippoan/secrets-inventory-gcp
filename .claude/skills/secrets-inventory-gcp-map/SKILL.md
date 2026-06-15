@@ -1,8 +1,8 @@
 ---
 name: secrets-inventory-gcp-map
-generated-from: secrets-inventory-gcp:84d8e98cec63b7d45f5353fa7bb9b03e2da1ff8c
-paths: [cf.go, convert_pkcs8.go, gh.go, http_doer.go, iam_temp_grant.go, main.go, mint_health_oauth_jwt.go, secret_value.go, sync_from_gcp.go]
-description: ippoan/secrets-inventory-gcp (Go / Cloud Run、ippoan/secrets-inventory Worker から GCP Secret Manager / IAM / CF Secrets Store / GitHub org secret を代行する薄い proxy) の構造ナビゲーション。read 系 (list-secrets / list-service-accounts) と最小 write 例外 (add-version / create-secret / sa-disable / cf・gh proxy / sync-from-gcp) の endpoint 配置・認証境界・GCP key 0 個運用・rotate guardrail を 1 枚にまとめる。トリガー:「secrets-inventory-gcp」「list-secrets」「add-version」「create-secret」「sync-from-gcp」「sa-disable」「cf service token」「gh org secret」「X-Inventory-API-Key」「rotate-mcp」「secret rotate」等。
+generated-from: secrets-inventory-gcp:a76a7960263627c3724c123850267f16e0ca7f96
+paths: [cf.go, convert_pkcs8.go, gh.go, gh_variables.go, http_doer.go, iam_temp_grant.go, main.go, mint_health_oauth_jwt.go, secret_value.go, sync_from_gcp.go]
+description: ippoan/secrets-inventory-gcp (Go / Cloud Run、ippoan/secrets-inventory Worker から GCP Secret Manager / IAM / CF Secrets Store / GitHub org secret を代行する薄い proxy) の構造ナビゲーション。read 系 (list-secrets / list-service-accounts) と最小 write 例外 (add-version / create-secret / sa-disable / cf・gh proxy / sync-from-gcp) の endpoint 配置・認証境界・GCP key 0 個運用・rotate guardrail を 1 枚にまとめる。トリガー:「secrets-inventory-gcp」「list-secrets」「add-version」「create-secret」「sync-from-gcp」「sa-disable」「cf service token」「gh org secret」「gh repo variable」「/gh/variables」「Actions variable」「X-Inventory-API-Key」「rotate-mcp」「secret rotate」等。
 ---
 
 # secrets-inventory-gcp-map — ippoan/secrets-inventory-gcp 構造ナビゲーション
@@ -22,6 +22,7 @@ create / SA disable / CF・GitHub secret proxy) を ADC (metadata server) 経由
 | `main.go` | `main` / `newMuxWith` / `requireAPIKey` / `mustEnv` / `handleHealth` / `handleListSecrets` / `handleListServiceAccounts` / `handleSetSADisabled` / `handleAddSecretVersion` / `handleCreateSecret` | HTTP layer。route 登録 + API key 認証 + read/SA/secret write handler |
 | `cf.go` | `cfConfig` / `handleCfList` / `handleCfCreate` / `handleCfRotate` / `handleCfServiceToken{List,Create,Rotate,Delete}` | CF Secrets Store + CF service token proxy。token は SM から runtime 取得 |
 | `gh.go` | `ghConfig` / `handleGhList` / `handleGhPut` / `sealedBoxEncrypt` | GitHub org secrets proxy。**libsodium sealed box encrypt を proxy 側で実行** |
+| `gh_variables.go` | `handleGhVariablesList` / `handleGhVariablePut` / `parseGhRepoParam` / `newGhRequest` | GitHub Actions **repo variables** proxy (平文 config、secret ではない = 暗号化なし)。`?repo=owner/name`、upsert は GET→POST/PATCH |
 | `sync_from_gcp.go` | `handleSyncFromGcp` / `propagateToGh` / `propagateToCf` / `cfLookupByName` | source SM secret を CF / GitHub に伝播する `/sync-from-gcp/:name` |
 | `iam_temp_grant.go` | `liveTempGrantManager` / `GrantThenRead` / `appendTempBinding` / `tempGrantExpression` | sync 用に proxy が**自分自身に** TTL≤10 分 Condition 付き accessor を grant→read→revoke |
 | `secret_value.go` | `liveSecretValueGetter` / `cachedSecretValueGetter` | SM short name → value 取得 (5 分 TTL cache、cf/gh の token 用) |
@@ -50,6 +51,7 @@ create / SA disable / CF・GitHub secret proxy) を ADC (metadata server) 経由
 | GET/POST | `/cf/secrets` `/cf/secrets/{id}` | `handleCfList/Create/Rotate` | CF Secrets Store proxy |
 | GET/POST/DELETE | `/cf/service-tokens` `/cf/service-tokens/{id}` | `handleCfServiceToken*` | CF service token (delete 時 `?sm_secret_name=` で audit label patch) |
 | GET/PUT | `/gh/secrets` `/gh/secrets/{name}` | `handleGhList/Put` | GitHub org secret proxy (sealed box) |
+| GET/PUT | `/gh/variables` `/gh/variables/{name}` | `handleGhVariablesList/Put` | GitHub Actions repo variables proxy (平文、`?repo=owner/name`) |
 
 ## gotcha (CLAUDE.md / README 由来)
 
