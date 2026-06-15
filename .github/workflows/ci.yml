@@ -160,7 +160,13 @@ jobs:
       # 5 env のうち 1 つでも空のままなら main.go の requireCfConfigured /
       # requireGhConfigured が 503 を返すので、Secret Manager 投入完了前でも
       # deploy 自体は safe (CLAUDE.md "運用 setup と code deploy の分離" 節)。
-      set_env_vars: GCP_PROJECT_ID=${{ vars.GCP_PROJECT_ID_STAGING }},CF_ACCOUNT_ID=24b45709d060d957340180e995f0d373,CF_STORE_ID=bd7bc91a3e5f4111add4acf6cb4b8733,CF_TOKEN_SECRET_NAME=cf-secrets-inventory-secrets-store-write,GITHUB_ORG=ippoan,GH_TOKEN_SECRET_NAME=gh-secrets-inventory-org-secrets-write
+      #
+      # GH_APP_ID_SECRET_NAME / GH_APP_PRIVATE_KEY_SECRET_NAME を両方
+      # 指定すると App mode (Refs #51) が有効化される。これにより `?gh_org=`
+      # で App が install されている任意の org (例: `ohishi-exp`) に
+      # secrets を sync 可能になる (PAT mode 時は GH_EXTRA_ORGS allowlist
+      # 必須だった)。値は CI App として既存の `ippoan-ci-bot` を再利用。
+      set_env_vars: GCP_PROJECT_ID=${{ vars.GCP_PROJECT_ID_STAGING }},CF_ACCOUNT_ID=24b45709d060d957340180e995f0d373,CF_STORE_ID=bd7bc91a3e5f4111add4acf6cb4b8733,CF_TOKEN_SECRET_NAME=cf-secrets-inventory-secrets-store-write,GITHUB_ORG=ippoan,GH_TOKEN_SECRET_NAME=gh-secrets-inventory-org-secrets-write,GH_APP_ID_SECRET_NAME=CI_APP_ID,GH_APP_PRIVATE_KEY_SECRET_NAME=CI_APP_PRIVATE_KEY
       update_secrets: INVENTORY_API_KEY=SECRETS_INVENTORY_GCP_PROXY_API_KEY_STAGING:latest
 
   # 全 CI job (= ci / build-image / deploy-staging) が success した時だけ
