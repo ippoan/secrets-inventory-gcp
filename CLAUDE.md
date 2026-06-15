@@ -136,6 +136,17 @@ PR テンプレートは `.github/pull_request_template.md` で `Refs` を強制
     Go の `golang.org/x/crypto/nacl/box.SealAnonymous` を使用。PAT は
     `gh-secrets-inventory-org-secrets-write` から runtime 取得 (5 分 TTL)。
     `X-Fail-If-Exists: true` で事前 GET → 200 なら 409 reject
+  - **GitHub Actions repo variables proxy (`/gh/variables*`)** — `gh.go` の
+    org secrets と同じ App/PAT token を使う **平文 config 値** 用の経路
+    (`gh_variables.go`)。`GET /gh/variables?repo=owner/name` (list)、
+    `PUT /gh/variables/{name}?repo=owner/name` (upsert: 事前 GET → 無ければ
+    `POST` create / 有れば `PATCH` update、`created` boolean で識別)。
+    **secret ではないので sealed box 暗号化しない / log に value を出さないが
+    list では value を返す** (= 平文 config なので隠さない)。GitHub App 利用時は
+    App に **Repository permissions → Variables: Read and write** が必要
+    (org Secrets 権限とは別。無いと 403 "Resource not accessible by integration")。
+    用途例: `STAGING_DEPLOY_ENABLED` 等の CI gate variable を MCP から設定する
+    (= 手動 Settings UI 操作を不要にする)
   - **CF service token delete の audit label patch (`DELETE /cf/service-tokens/{id}?sm_secret_name=`)**
     — Refs #68。`delete_service_token` に `sm_secret_name` を渡すと、CF token を
     revoke した後にその client_secret 保管 SM secret へ `cf_service_token=deleted`
