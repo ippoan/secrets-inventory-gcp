@@ -126,9 +126,15 @@ PR テンプレートは `.github/pull_request_template.md` で `Refs` を強制
       されている org すべて**に書ける = per-org PAT 不要。App 側に
       Organization permissions → Secrets: Read and write が必要 (無いと
       secrets API が 403 "Resource not accessible by integration")
-    - **PAT mode (fallback)** — `GH_TOKEN_SECRET_NAME` (default org) +
-      `GH_EXTRA_ORGS` (comma 区切り `org=tokenSecretName` の allowlist、
-      org ごとに専用 PAT を分離)。App mode 有効時は使われない
+    - **PAT mode (fallback) — 2026-06 退役 (retired)** —
+      `GH_TOKEN_SECRET_NAME` (default org) + `GH_EXTRA_ORGS` (comma 区切り
+      `org=tokenSecretName` の allowlist、org ごとに専用 PAT を分離)。App mode
+      有効時は使われない。fallback PAT `gh-secrets-inventory-org-secrets-write`
+      は有効期限到来時に **rotate せず失効・無効化**した (App mode が primary で
+      実行時に読まれないため影響なし)。`GH_TOKEN_SECRET_NAME` env は dormant
+      fallback として残置。復活時は新 fine-grained PAT
+      (`organization_secrets: read+write`、owner=`ippoan`) で同名 secret を
+      再作成すること。詳細は README「GitHub org secret 書込の認証」節を参照
     未指定は従来どおり `GITHUB_ORG`、解決できない org は 400。
     GitHub Actions org secret 必須の **libsodium sealed box encrypt
     (Curve25519 + XSalsa20-Poly1305 + blake2b nonce) は proxy 側で実行**
