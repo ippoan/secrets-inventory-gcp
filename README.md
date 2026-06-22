@@ -69,6 +69,17 @@ read endpoint の他に write/proxy endpoint (`/add-version` / `/create-secret` 
 - **PAT mode (fallback)** — `GH_TOKEN_SECRET_NAME` (default org) + `GH_EXTRA_ORGS`
   (comma 区切り `org=tokenSecretName` allowlist、org ごとに専用 PAT)。App mode 無効時。
 
+> **PAT mode は 2026-06 に退役 (retired)。** fallback 用の fine-grained PAT
+> `gh-secrets-inventory-org-secrets-write` は有効期限が来たため、**rotate せず
+> 失効させ無効化した**。現在 Cloud Run service (`secrets-inventory-gcp-staging`)
+> には `GH_APP_ID_SECRET_NAME=CI_APP_ID` / `GH_APP_PRIVATE_KEY_SECRET_NAME=CI_APP_PRIVATE_KEY`
+> が設定済みで **App mode が primary**。App mode 有効時は PAT は実行時に読まれない
+> ため、`gh-secrets-inventory-org-secrets-write` が失効しても `/gh/*` `/sync-from-gcp`
+> は影響を受けない (= GitHub 通知の期限切れアラートは無視してよい)。
+> `GH_TOKEN_SECRET_NAME` env は dormant fallback として残置。PAT fallback を将来
+> 復活させたい場合は新しい fine-grained PAT (`organization_secrets: read+write`、
+> resource owner = `ippoan`) を発行して同名 secret を再作成 + version 投入する。
+
 新 org オンボードは「App を install + permission 承認 → `sync_from_gcp { gh_org }` で
 配布 → caller は named secret 明示渡し」の 3 step (`secrets: inherit` はクロス org で
 効かない)。詳細は親 repo `ippoan/secrets-inventory` README / `ci-workflows` CLAUDE.md。
