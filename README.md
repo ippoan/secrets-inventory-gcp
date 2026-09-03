@@ -86,17 +86,39 @@ read endpoint の他に write/proxy endpoint (`/add-version` / `/create-secret` 
 
 ## GCP 側 setup (one-time)
 
-詳細は [issue #1](https://github.com/ippoan/secrets-inventory-gcp/issues/1) を参照。要点:
+実行コマンド込みの正本は
+[`.claude/skills/secrets-inventory-gcp-map/SKILL.md`](.claude/skills/secrets-inventory-gcp-map/SKILL.md)
+の「GCP 側 (one-time、`cloudsql-sv` project)」節
+(経緯は [issue #1](https://github.com/ippoan/secrets-inventory-gcp/issues/1)、
+WIF 方針は [ippoan/secrets-inventory#3](https://github.com/ippoan/secrets-inventory/issues/3))。要点:
 
-- `cloud-run-deployer-staging` / `cloud-run-deployer` SA (deploy 用、JSON
-  key を発行して GitHub repo secret `GCP_DEPLOY_SA_KEY_STAGING` /
-  `GCP_DEPLOY_SA_KEY` に登録。rust-alc-api パターン)
-- `secrets-inventory-runtime-staging` / `secrets-inventory-runtime` SA
-  (Cloud Run attached、`roles/secretmanager.viewer` のみ。**JSON key は
-  発行しない** — Cloud Run の metadata server + ADC で取る)
+- **GCP の user-managed JSON key は 0 本** — runtime も deploy も発行しない
+- **deploy** = WIF (Workload Identity Federation + GitHub OIDC trust)。
+  pool / provider は既存の `gh-actions-pool` / `github`、impersonate 先は
+  `staging-deploy@cloudsql-sv.iam.gserviceaccount.com`
+  (`roles/run.admin` / `iam.serviceAccountUser` / `artifactregistry.reader` /
+  `secretmanager.viewer` / `secretmanager.secretAccessor` / custom role
+  `secretsInventoryLabeler` ほか)。repo ごとの impersonate 許可は SA-level の
+  `roles/iam.workloadIdentityUser` principal binding で行う
+- **runtime** = Cloud Run attached SA
+  `secrets-inventory-viewer@cloudsql-sv.iam.gserviceaccount.com` + ADC
+  (metadata server)。IAM は read-only を基本
+  (`roles/secretmanager.viewer` / `roles/iam.securityReviewer` /
+  `roles/policyanalyzer.activityAnalysisViewer`) に、reversible な write 例外のみ追加
 - shared secret (32 byte) を Google Secret Manager に格納し、Cloud Run が
   起動時に env var `INVENTORY_API_KEY` として参照
 - 同値を Cloudflare Secrets Store にも投入 (`SECRETS_INVENTORY_GCP_PROXY_API_KEY`)
+
+> **GitHub repo secret に GCP key は置かない。** WIF 以前に使っていた
+> `GCP_SA_KEY` secret は不要になり削除済み。代わりに repo / org variables
+> `GCP_REGION` / `GCP_PROJECT_ID_STAGING` / `GCP_WIF_PROVIDER` /
+> `GCP_WIF_SERVICE_ACCOUNT_STAGING` を設定する
+> (いずれかが空だと `ci.yml` の `deploy-staging` job は `if:` で skip される)。
+>
+> 旧設計にあった `cloud-run-deployer-staging` / `cloud-run-deployer`
+> (JSON key を repo secret `GCP_DEPLOY_SA_KEY*` に登録する deploy SA) と
+> `secrets-inventory-runtime-staging` / `secrets-inventory-runtime` (runtime SA) は
+> **採用されなかった初期案**で、現行構成では使っていない。
 
 ## 開発ルール
 
