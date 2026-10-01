@@ -30,6 +30,11 @@ import (
 //   - gh_name   = GitHub Actions secret 名 (省略時 src_name)
 //   - cf_name   = CF Secrets Store 名 (省略時 src_name)
 //   - visibility= GitHub visibility (省略時 "all")
+//   - repos     = visibility=selected のときの対象 repo **名** の CSV
+//     (`owner/` を付けない。org は gh_org 解決後の org に固定)。
+//     selected かつ targets に gh があるとき必須、それ以外では指定不可。
+//     最大 50 個。proxy が `GET /repos/{org}/{name}` で数値 id に解決し、
+//     PUT body の `selected_repository_ids` に載せる (Refs #66)
 //   - scopes    = CF scope CSV (省略時 "workers")
 //   - fail_if_exists = "true" (default) / "false"
 //
@@ -55,6 +60,9 @@ type syncTargetResult struct {
 	SecretName string `json:"secret_name,omitempty"`
 	SecretID   string `json:"secret_id,omitempty"` // CF のみ
 	Created    bool   `json:"created,omitempty"`
+	// SelectedRepositories は visibility=selected で PUT に載せた対象 repo の
+	// 個数 (GH のみ。名前・id は返さない)。
+	SelectedRepositories int `json:"selected_repositories,omitempty"`
 }
 
 type syncFromGcpResponse struct {
@@ -177,6 +185,28 @@ func handleSyncFromGcp(
 			return
 		}
 
+		// `repos` は visibility=selected の対象 repo。selected なのに対象を
+		// 渡さないと GitHub は成功を返しつつ「どの repo からも見えない org
+		// secret」を作るので、ここで必ず弾く (Refs #66)。
+		repos, err := parseSyncRepos(q.Get("repos"))
+		if err != nil {
+			log.Printf("SYNC_FROM_GCP repos rejected: %v", err)
+			http.Error(w, "invalid repos", http.StatusBadRequest)
+			return
+		}
+		if len(repos) > 0 && !wantGh {
+			http.Error(w, "repos requires targets to include gh", http.StatusBadRequest)
+			return
+		}
+		if len(repos) > 0 && visibility != "selected" {
+			http.Error(w, "repos is only allowed when visibility=selected", http.StatusBadRequest)
+			return
+		}
+		if wantGh && visibility == "selected" && len(repos) == 0 {
+			http.Error(w, "repos is required when visibility=selected", http.StatusBadRequest)
+			return
+		}
+
 		scopes := parseCsvQuery(q.Get("scopes"))
 		if len(scopes) == 0 {
 			scopes = []string{"workers"}
@@ -195,12 +225,26 @@ func handleSyncFromGcp(
 
 		actor := sanitizeLogValue(r.Header.Get("X-Actor-Email"))
 		source := sanitizeLogValue(srcName)
-		log.Printf("SYNC_FROM_GCP requested actor=%q source=%q targets=%q gh_org=%q gh_name=%q cf_name=%q",
+		log.Printf("SYNC_FROM_GCP requested actor=%q source=%q targets=%q gh_org=%q gh_name=%q cf_name=%q repos_count=%d repos=%q",
 			actor, source, sanitizeLogValue(rawTargets),
-			sanitizeLogValue(effGhCfg.org), sanitizeLogValue(ghName), sanitizeLogValue(cfName))
+			sanitizeLogValue(effGhCfg.org), sanitizeLogValue(ghName), sanitizeLogValue(cfName),
+			len(repos), sanitizeLogValue(strings.Join(repos, ",")))
 
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
+
+		// 0. repo 名 → 数値 id。source secret を読む (= temp grant を張る) より
+		// 前、GitHub に何も書く前に解決し、1 つでも解決できなければ全体を
+		// 失敗させる。
+		var repoIDs []int64
+		if len(repos) > 0 {
+			ids, status, msg := resolveGhRepoIDs(ctx, repos, effGhCfg, getter, httpClient, actor)
+			if status != 0 {
+				http.Error(w, msg, status)
+				return
+			}
+			repoIDs = ids
+		}
 
 		// 1. Read source value from GCP。
 		// srcGetter が grantingSrcReader なら ここで自動的に conditional
@@ -223,7 +267,7 @@ func handleSyncFromGcp(
 		ok := true
 
 		if wantGh {
-			r := propagateToGh(ctx, ghName, value, visibility, failIfExists,
+			r := propagateToGh(ctx, ghName, value, visibility, repoIDs, failIfExists,
 				effGhCfg, getter, httpClient, actor)
 			results["gh"] = r
 			if r.Status != "ok" {
@@ -258,12 +302,100 @@ func handleSyncFromGcp(
 	})
 }
 
+// maxSyncRepos は `repos` に渡せる repo 名の上限。
+const maxSyncRepos = 50
+
+// parseSyncRepos は `?repos=a,b` を repo 名の slice にする (分解は scopes と
+// 同じ parseCsvQuery)。重複は除き、順序は初出順。名前は ghRepoNamePattern で
+// 検証する。`.` / `..` は pattern を通るが URL path の dot segment になるので
+// 個別に弾く。
+func parseSyncRepos(raw string) ([]string, error) {
+	seen := map[string]bool{}
+	var out []string
+	for _, name := range parseCsvQuery(raw) {
+		if !ghRepoNamePattern.MatchString(name) || name == "." || name == ".." {
+			return nil, fmt.Errorf("invalid repo name %q", sanitizeLogValue(name))
+		}
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	if len(out) > maxSyncRepos {
+		return nil, fmt.Errorf("too many repos (%d > %d)", len(out), maxSyncRepos)
+	}
+	return out, nil
+}
+
+// resolveGhRepoIDs は repo 名を `GET /repos/{cfg.org}/{name}` で数値 id に
+// 解決する。token は secret の書き込みと同じ cfg.token()。org は cfg.org 固定
+// なので別 org の repo は渡せない (rename / transfer の redirect で別 owner の
+// repo が返った場合も owner を照合して弾く)。
+//
+// 失敗時は (nil, HTTP status, response 文言) を返す。成功時 status は 0。
+func resolveGhRepoIDs(
+	ctx context.Context,
+	names []string,
+	cfg ghConfig,
+	getter secretValueGetter,
+	http_ httpDoer,
+	actor string,
+) ([]int64, int, string) {
+	token, err := cfg.token(ctx, getter, http_)
+	if err != nil {
+		log.Printf("SYNC_GH repo-resolve token fetch failed actor=%q err=%v", actor, err)
+		return nil, http.StatusBadGateway, "upstream error (gh token)"
+	}
+	ids := make([]int64, 0, len(names))
+	for _, name := range names {
+		repoURL := fmt.Sprintf("%s/repos/%s/%s", githubAPI, cfg.org, name)
+		res, err := http_.Do(newGhRequest(ctx, http.MethodGet, repoURL, token, nil))
+		if err != nil {
+			log.Printf("SYNC_GH repo-resolve network actor=%q repo=%q err=%v", actor, name, err)
+			return nil, http.StatusBadGateway, "upstream error (gh repo lookup)"
+		}
+		if res.StatusCode == http.StatusNotFound {
+			res.Body.Close()
+			log.Printf("SYNC_GH repo-resolve not found actor=%q repo=%q", actor, name)
+			return nil, http.StatusBadRequest, "repo not found or not accessible: " + name
+		}
+		if res.StatusCode != http.StatusOK {
+			res.Body.Close()
+			log.Printf("SYNC_GH repo-resolve upstream %d actor=%q repo=%q",
+				res.StatusCode, actor, name)
+			return nil, http.StatusBadGateway, "upstream error (gh repo lookup)"
+		}
+		var repo struct {
+			ID    int64 `json:"id"`
+			Owner struct {
+				Login string `json:"login"`
+			} `json:"owner"`
+		}
+		err = json.NewDecoder(res.Body).Decode(&repo)
+		res.Body.Close()
+		if err != nil || repo.ID == 0 {
+			log.Printf("SYNC_GH repo-resolve decode actor=%q repo=%q err=%v", actor, name, err)
+			return nil, http.StatusBadGateway, "upstream error (gh repo lookup)"
+		}
+		if !strings.EqualFold(repo.Owner.Login, cfg.org) {
+			log.Printf("SYNC_GH repo-resolve owner mismatch actor=%q repo=%q owner=%q",
+				actor, name, sanitizeLogValue(repo.Owner.Login))
+			return nil, http.StatusBadRequest, "repo not found or not accessible: " + name
+		}
+		ids = append(ids, repo.ID)
+	}
+	return ids, 0, ""
+}
+
 // propagateToGh は handleGhPut の内側 logic を value 引数化したもの。
 // CF と並走させるため failure は status="fail" + error を返す pattern にし
 // HTTP response は呼び元 (handleSyncFromGcp) で組み立てる。
+// repoIDs は visibility=selected のときだけ非空 (handler が保証)。
 func propagateToGh(
 	ctx context.Context,
 	name, value, visibility string,
+	repoIDs []int64,
 	failIfExists bool,
 	cfg ghConfig,
 	getter secretValueGetter,
@@ -341,7 +473,10 @@ func propagateToGh(
 		EncryptedValue string `json:"encrypted_value"`
 		KeyID          string `json:"key_id"`
 		Visibility     string `json:"visibility"`
-	}{EncryptedValue: encryptedB64, KeyID: pk.KeyID, Visibility: visibility})
+		// selected のときだけ載る。PUT は対象 repo を body の内容で置き換える。
+		SelectedRepositoryIDs []int64 `json:"selected_repository_ids,omitempty"`
+	}{EncryptedValue: encryptedB64, KeyID: pk.KeyID, Visibility: visibility,
+		SelectedRepositoryIDs: repoIDs})
 
 	putURL := fmt.Sprintf("%s/orgs/%s/actions/secrets/%s", githubAPI, cfg.org, name)
 	putReq, _ := http.NewRequestWithContext(ctx, http.MethodPut, putURL,
@@ -363,11 +498,13 @@ func propagateToGh(
 		return syncTargetResult{Status: "fail", Error: "gh put upstream"}
 	}
 
-	log.Printf("SYNC_GH ok actor=%q target=%q created=%v", actor, target, failIfExists)
+	log.Printf("SYNC_GH ok actor=%q target=%q created=%v selected_repositories=%d",
+		actor, target, failIfExists, len(repoIDs))
 	return syncTargetResult{
-		Status:     "ok",
-		SecretName: name,
-		Created:    failIfExists, // fail_if_exists=true で 404 → created の意。handleGhPut と同 contract
+		Status:               "ok",
+		SecretName:           name,
+		Created:              failIfExists, // fail_if_exists=true で 404 → created の意。handleGhPut と同 contract
+		SelectedRepositories: len(repoIDs),
 	}
 }
 
