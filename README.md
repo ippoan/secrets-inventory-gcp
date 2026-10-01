@@ -59,6 +59,10 @@ read endpoint の他に write/proxy endpoint (`/add-version` / `/create-secret` 
 ### GitHub org secret 書込の認証 (App mode / 別 org 対応)
 
 `/gh/secrets*` と `/sync-from-gcp` の `?gh_org=` は **default org 以外**にも書ける。
+`/sync-from-gcp` で `?visibility=selected` を使うときは `?repos=` (その org の repo
+**名**の CSV、`owner/` なし、最大 50 個) が必須。proxy が `GET /repos/{org}/{name}` で
+id に解決して `selected_repository_ids` を付ける (省略すると 400。対象 0 の org secret を
+作らないため)。
 認証 backend は 2 mode (Refs #51 / #49):
 
 - **GitHub App installation token mode (推奨)** — env `GH_APP_ID_SECRET_NAME` +

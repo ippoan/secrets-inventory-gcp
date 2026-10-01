@@ -23,7 +23,7 @@ create / SA disable / CF・GitHub secret proxy) を ADC (metadata server) 経由
 | `cf.go` | `cfConfig` / `handleCfList` / `handleCfCreate` / `handleCfRotate` / `handleCfServiceToken{List,Create,Rotate,Delete}` | CF Secrets Store + CF service token proxy。token は SM から runtime 取得 |
 | `gh.go` | `ghConfig` / `handleGhList` / `handleGhPut` / `sealedBoxEncrypt` | GitHub org secrets proxy。**libsodium sealed box encrypt を proxy 側で実行** |
 | `gh_variables.go` | `handleGhVariablesList` / `handleGhVariablePut` / `parseGhRepoParam` / `newGhRequest` | GitHub Actions **repo variables** proxy (平文 config、secret ではない = 暗号化なし)。`?repo=owner/name`、upsert は GET→POST/PATCH |
-| `sync_from_gcp.go` | `handleSyncFromGcp` / `propagateToGh` / `propagateToCf` / `cfLookupByName` | source SM secret を CF / GitHub に伝播する `/sync-from-gcp/:name` |
+| `sync_from_gcp.go` | `handleSyncFromGcp` / `parseSyncRepos` / `resolveGhRepoIDs` / `propagateToGh` / `propagateToCf` / `cfLookupByName` | source SM secret を CF / GitHub に伝播する `/sync-from-gcp/:name` |
 | `iam_temp_grant.go` | `liveTempGrantManager` / `GrantThenRead` / `appendTempBinding` / `tempGrantExpression` | sync 用に proxy が**自分自身に** TTL≤10 分 Condition 付き accessor を grant→read→revoke |
 | `secret_value.go` | `liveSecretValueGetter` / `cachedSecretValueGetter` | SM short name → value 取得 (5 分 TTL cache、cf/gh の token 用) |
 | `convert_pkcs8.go` | `convertPkcs1ToPkcs8` / `handleConvertPkcs8` | `/convert-pkcs8/` PKCS1→PKCS8 変換 |
@@ -46,7 +46,7 @@ create / SA disable / CF・GitHub secret proxy) を ADC (metadata server) 経由
 | POST | `/add-version` | `handleAddSecretVersion` | write 例外 (rotate-mcp)。`secretVersionAdder` のみ |
 | POST | `/create-secret` | `handleCreateSecret` | write 例外 (create-mcp)。`secretCreator` + `secretVersionAdder` |
 | POST | `/mint-health-oauth-jwt` | `handleMintHealthOAuthJwt` | HS256 JWT mint |
-| GET | `/sync-from-gcp/:name` | `handleSyncFromGcp` | source secret を CF / GitHub に伝播 |
+| POST | `/sync-from-gcp/:name` | `handleSyncFromGcp` | source secret を CF / GitHub に伝播。`?visibility=selected` は `?repos=` (repo **名**の CSV、org は `gh_org` 解決後の org 固定、最大 50) が必須 — proxy が id に解決して `selected_repository_ids` を付ける |
 | POST | `/convert-pkcs8/` | `handleConvertPkcs8` | PKCS1→PKCS8 |
 | GET/POST | `/cf/secrets` `/cf/secrets/{id}` | `handleCfList/Create/Rotate` | CF Secrets Store proxy |
 | GET/POST/DELETE | `/cf/service-tokens` `/cf/service-tokens/{id}` | `handleCfServiceToken*` | CF service token (delete 時 `?sm_secret_name=` で audit label patch) |

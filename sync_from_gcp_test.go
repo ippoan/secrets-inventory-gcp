@@ -71,6 +71,11 @@ func TestSyncFromGcp_ValidationErrors(t *testing.T) {
 		{"invalid cf_name", "/sync-from-gcp/MY_SECRET?targets=cf&cf_name=1abc", http.StatusBadRequest},
 		{"invalid visibility", "/sync-from-gcp/MY_SECRET?targets=gh&visibility=public", http.StatusBadRequest},
 		{"invalid fail_if_exists", "/sync-from-gcp/MY_SECRET?targets=gh&fail_if_exists=maybe", http.StatusBadRequest},
+		// repos (Refs #66)。詳細な表は TestSyncFromGcp_Repos_ValidationErrors。
+		{"selected without repos", "/sync-from-gcp/MY_SECRET?targets=gh&visibility=selected", http.StatusBadRequest},
+		{"all with repos", "/sync-from-gcp/MY_SECRET?targets=gh&visibility=all&repos=repo-a", http.StatusBadRequest},
+		{"invalid repo name", "/sync-from-gcp/MY_SECRET?targets=gh&visibility=selected&repos=a/b", http.StatusBadRequest},
+		{"repos without gh target", "/sync-from-gcp/MY_SECRET?targets=cf&visibility=selected&repos=repo-a", http.StatusBadRequest},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -745,5 +750,409 @@ func TestSyncFromGcp_GhOrg_Success_PropagatesToExtraOrg(t *testing.T) {
 	}
 	if string(opened) != "-----BEGIN PRIVATE KEY-----fake" {
 		t.Fatalf("plaintext mismatch")
+	}
+}
+
+// ---- repos (visibility=selected の対象 repo、Refs #66) ----
+
+// errOnURLDoer は URL に needle を含む request だけ network error にする。
+type errOnURLDoer struct {
+	inner  httpDoer
+	needle string
+}
+
+func (d *errOnURLDoer) Do(req *http.Request) (*http.Response, error) {
+	if strings.Contains(req.URL.String(), d.needle) {
+		return nil, errors.New("simulated network error")
+	}
+	return d.inner.Do(req)
+}
+
+// syncPutBodies は fake doer が受けた PUT の body を順に返す。
+func syncPutBodies(t *testing.T, doer *fakeHTTPDoer) [][]byte {
+	t.Helper()
+	var out [][]byte
+	for _, c := range doer.calls {
+		if c.Method == http.MethodPut {
+			b, _ := io.ReadAll(c.Body)
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+func TestSyncFromGcp_Repos_ValidationErrors(t *testing.T) {
+	tooMany := make([]string, 0, maxSyncRepos+1)
+	for i := 0; i <= maxSyncRepos; i++ {
+		tooMany = append(tooMany, "repo-"+string(rune('a'+i/26))+string(rune('a'+i%26)))
+	}
+	base := "/sync-from-gcp/MY_SECRET?"
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"selected without repos", base + "targets=gh&visibility=selected"},
+		{"selected with empty repos", base + "targets=gh&visibility=selected&repos="},
+		{"selected with only commas", base + "targets=gh&visibility=selected&repos=,,"},
+		{"visibility omitted (all) with repos", base + "targets=gh&repos=repo-a"},
+		{"all with repos", base + "targets=gh&visibility=all&repos=repo-a"},
+		{"private with repos", base + "targets=gh&visibility=private&repos=repo-a"},
+		{"owner-qualified name", base + "targets=gh&visibility=selected&repos=ippoan/repo-a"},
+		{"name with space", base + "targets=gh&visibility=selected&repos=repo-a,bad%20name"},
+		{"dot segment", base + "targets=gh&visibility=selected&repos=.."},
+		{"single dot", base + "targets=gh&visibility=selected&repos=."},
+		{"name too long", base + "targets=gh&visibility=selected&repos=" + strings.Repeat("a", 101)},
+		{"too many repos", base + "targets=gh&visibility=selected&repos=" + strings.Join(tooMany, ",")},
+		{"targets without gh", base + "targets=cf&visibility=selected&repos=repo-a"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doer := &fakeHTTPDoer{}
+			getter := &fakeSecretValueGetter{values: map[string]string{
+				"MY_SECRET": "v", "gh-token": "tok", "cf-token": "tok",
+			}}
+			mux := newSyncTestMux(getter, doer)
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, newSyncRequest(t, tc.path))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("got %d, want 400 (body=%s)", rec.Code, rec.Body.String())
+			}
+			// 検証は secret を読む / GitHub を叩くより前。
+			if n := getter.calls.Load(); n != 0 {
+				t.Errorf("secret getter called %d times before validation", n)
+			}
+			if len(doer.calls) != 0 {
+				t.Errorf("upstream called %d times before validation", len(doer.calls))
+			}
+		})
+	}
+}
+
+func TestSyncFromGcp_Repos_SelectedWithoutRepos_Message(t *testing.T) {
+	mux := newSyncTestMux(&fakeSecretValueGetter{}, &fakeHTTPDoer{})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, newSyncRequest(t, "/sync-from-gcp/MY_SECRET?targets=gh&visibility=selected"))
+	if rec.Code != http.StatusBadRequest ||
+		!strings.Contains(rec.Body.String(), "repos is required when visibility=selected") {
+		t.Fatalf("got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSyncFromGcp_Repos_ExactlyMaxAccepted(t *testing.T) {
+	names := make([]string, 0, maxSyncRepos)
+	for i := 0; i < maxSyncRepos; i++ {
+		names = append(names, "repo-"+string(rune('a'+i/26))+string(rune('a'+i%26)))
+	}
+	got, err := parseSyncRepos(strings.Join(names, ","))
+	if err != nil || len(got) != maxSyncRepos {
+		t.Fatalf("got %d names, err=%v", len(got), err)
+	}
+}
+
+// targets=cf のみなら visibility=selected でも repos は要求しない
+// (visibility は gh にしか効かない = 従来挙動を変えない)。
+func TestSyncFromGcp_Repos_NotRequiredWithoutGhTarget(t *testing.T) {
+	mux := newSyncTestMux(&fakeSecretValueGetter{err: errors.New("boom")}, &fakeHTTPDoer{})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, newSyncRequest(t, "/sync-from-gcp/MY_SECRET?targets=cf&visibility=selected"))
+	if rec.Code == http.StatusBadRequest {
+		t.Fatalf("got 400 body=%s", rec.Body.String())
+	}
+}
+
+func TestSyncFromGcp_Repos_Selected_Success_PutsSelectedRepositoryIDs(t *testing.T) {
+	_, _, pubB64 := genGhPubkey(t)
+	doer := &fakeHTTPDoer{}
+	doer.respond("GET https://api.github.com/repos/ippoan/repo-a",
+		http.StatusOK, `{"id":101,"name":"repo-a","owner":{"login":"ippoan"}}`)
+	doer.respond("GET https://api.github.com/repos/ippoan/repo.b",
+		http.StatusOK, `{"id":202,"name":"repo.b","owner":{"login":"Ippoan"}}`)
+	doer.respond("GET https://api.github.com/orgs/ippoan/actions/secrets/MY_SECRET",
+		http.StatusNotFound, "")
+	doer.respond("GET https://api.github.com/orgs/ippoan/actions/secrets/public-key",
+		http.StatusOK, `{"key_id":"kid-1","key":"`+pubB64+`"}`)
+	doer.respond("PUT https://api.github.com/orgs/ippoan/actions/secrets/MY_SECRET",
+		http.StatusCreated, "")
+	getter := &fakeSecretValueGetter{values: map[string]string{
+		"MY_SECRET": "plain-secret-value", "gh-token": "ghpat",
+	}}
+
+	mux := newSyncTestMux(getter, doer)
+	// 重複 (repo-a) は 1 回だけ解決され、id も 1 個だけ載る。
+	req := newSyncRequest(t,
+		"/sync-from-gcp/MY_SECRET?targets=gh&visibility=selected&repos=repo-a,repo.b,repo-a")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp syncFromGcpResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if r := resp.Results["gh"]; r.Status != "ok" || r.SelectedRepositories != 2 {
+		t.Fatalf("gh result: %+v", r)
+	}
+	if strings.Contains(rec.Body.String(), "plain-secret-value") {
+		t.Fatal("response leaked plaintext")
+	}
+
+	// 解決は書き込みと同じ token で、PUT より前に行われる。
+	var order []string
+	for _, c := range doer.calls {
+		order = append(order, c.Method+" "+c.URL.Path)
+		if got := c.Header.Get("Authorization"); got != "Bearer ghpat" {
+			t.Errorf("%s %s Authorization = %q", c.Method, c.URL, got)
+		}
+	}
+	want := []string{
+		"GET /repos/ippoan/repo-a",
+		"GET /repos/ippoan/repo.b",
+		"GET /orgs/ippoan/actions/secrets/MY_SECRET",
+		"GET /orgs/ippoan/actions/secrets/public-key",
+		"PUT /orgs/ippoan/actions/secrets/MY_SECRET",
+	}
+	if strings.Join(order, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("call order:\n%s\nwant:\n%s", strings.Join(order, "\n"), strings.Join(want, "\n"))
+	}
+
+	bodies := syncPutBodies(t, doer)
+	if len(bodies) != 1 {
+		t.Fatalf("PUT count = %d", len(bodies))
+	}
+	var put struct {
+		Visibility            string  `json:"visibility"`
+		SelectedRepositoryIDs []int64 `json:"selected_repository_ids"`
+	}
+	if err := json.Unmarshal(bodies[0], &put); err != nil {
+		t.Fatal(err)
+	}
+	if put.Visibility != "selected" {
+		t.Errorf("visibility = %q", put.Visibility)
+	}
+	if len(put.SelectedRepositoryIDs) != 2 ||
+		put.SelectedRepositoryIDs[0] != 101 || put.SelectedRepositoryIDs[1] != 202 {
+		t.Errorf("selected_repository_ids = %v", put.SelectedRepositoryIDs)
+	}
+}
+
+// 回帰: visibility 省略 (= all) の PUT body に selected_repository_ids の key
+// 自体が無い。
+func TestSyncFromGcp_Repos_VisibilityAll_OmitsSelectedRepositoryIDs(t *testing.T) {
+	_, _, pubB64 := genGhPubkey(t)
+	doer := &fakeHTTPDoer{}
+	doer.respond("GET https://api.github.com/orgs/ippoan/actions/secrets/public-key",
+		http.StatusOK, `{"key_id":"kid-1","key":"`+pubB64+`"}`)
+	doer.respond("PUT https://api.github.com/orgs/ippoan/actions/secrets/MY_SECRET",
+		http.StatusNoContent, "")
+	getter := &fakeSecretValueGetter{values: map[string]string{
+		"MY_SECRET": "v", "gh-token": "tok",
+	}}
+	mux := newSyncTestMux(getter, doer)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, newSyncRequest(t, "/sync-from-gcp/MY_SECRET?targets=gh&fail_if_exists=false"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "selected_repositories") {
+		t.Errorf("response has selected_repositories: %s", rec.Body.String())
+	}
+	bodies := syncPutBodies(t, doer)
+	if len(bodies) != 1 {
+		t.Fatalf("PUT count = %d", len(bodies))
+	}
+	var put map[string]json.RawMessage
+	if err := json.Unmarshal(bodies[0], &put); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := put["selected_repository_ids"]; ok {
+		t.Errorf("PUT body has selected_repository_ids: %s", bodies[0])
+	}
+	if string(put["visibility"]) != `"all"` {
+		t.Errorf("visibility = %s", put["visibility"])
+	}
+	for _, c := range doer.calls {
+		if strings.HasPrefix(c.URL.Path, "/repos/") {
+			t.Errorf("unexpected repo lookup: %s", c.URL)
+		}
+	}
+}
+
+// 解決に 1 つでも失敗したら、source secret を読まず GitHub にも書かない。
+func TestSyncFromGcp_Repos_ResolveFailures_NoWrite(t *testing.T) {
+	cases := []struct {
+		name     string
+		status   int
+		body     string
+		wantCode int
+		wantBody string
+	}{
+		{"404", http.StatusNotFound, `{"message":"Not Found"}`,
+			http.StatusBadRequest, "repo not found or not accessible: repo-b"},
+		{"403", http.StatusForbidden, "", http.StatusBadGateway, "upstream error"},
+		{"500", http.StatusInternalServerError, "", http.StatusBadGateway, "upstream error"},
+		{"bad json", http.StatusOK, `not-json`, http.StatusBadGateway, "upstream error"},
+		{"missing id", http.StatusOK, `{"owner":{"login":"ippoan"}}`,
+			http.StatusBadGateway, "upstream error"},
+		// rename / transfer の redirect で別 owner の repo が返った場合。
+		{"owner mismatch", http.StatusOK, `{"id":999,"owner":{"login":"other-org"}}`,
+			http.StatusBadRequest, "repo not found or not accessible: repo-b"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doer := &fakeHTTPDoer{}
+			doer.respond("GET https://api.github.com/repos/ippoan/repo-a",
+				http.StatusOK, `{"id":101,"owner":{"login":"ippoan"}}`)
+			doer.respond("GET https://api.github.com/repos/ippoan/repo-b", tc.status, tc.body)
+			getter := &fakeSecretValueGetter{values: map[string]string{
+				"MY_SECRET": "v", "gh-token": "tok",
+			}}
+			mux := newSyncTestMux(getter, doer)
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, newSyncRequest(t,
+				"/sync-from-gcp/MY_SECRET?targets=gh&visibility=selected&repos=repo-a,repo-b"))
+			if rec.Code != tc.wantCode || !strings.Contains(rec.Body.String(), tc.wantBody) {
+				t.Fatalf("got %d body=%s", rec.Code, rec.Body.String())
+			}
+			for _, c := range doer.calls {
+				if c.Method != http.MethodGet || !strings.HasPrefix(c.URL.Path, "/repos/ippoan/") {
+					t.Errorf("unexpected upstream call: %s %s", c.Method, c.URL)
+				}
+			}
+			// token の 1 回だけ。source secret (MY_SECRET) は読まれていない。
+			if n := getter.calls.Load(); n != 1 {
+				t.Errorf("secret getter calls = %d, want 1 (token only)", n)
+			}
+		})
+	}
+}
+
+func TestSyncFromGcp_Repos_ResolveNetworkError(t *testing.T) {
+	doer := &fakeHTTPDoer{}
+	getter := &fakeSecretValueGetter{values: map[string]string{
+		"MY_SECRET": "v", "gh-token": "tok",
+	}}
+	mux := newSyncTestMux(getter, &errOnURLDoer{inner: doer, needle: "/repos/"})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, newSyncRequest(t,
+		"/sync-from-gcp/MY_SECRET?targets=gh&visibility=selected&repos=repo-a"))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(doer.calls) != 0 {
+		t.Errorf("upstream called %d times after resolve failure", len(doer.calls))
+	}
+}
+
+func TestSyncFromGcp_Repos_ResolveTokenFetchFails(t *testing.T) {
+	doer := &fakeHTTPDoer{}
+	// gh-token が無い → token 取得で失敗。
+	getter := &fakeSecretValueGetter{values: map[string]string{"MY_SECRET": "v"}}
+	mux := newSyncTestMux(getter, doer)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, newSyncRequest(t,
+		"/sync-from-gcp/MY_SECRET?targets=gh&visibility=selected&repos=repo-a"))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(doer.calls) != 0 {
+		t.Errorf("upstream called %d times", len(doer.calls))
+	}
+}
+
+// gh_org 指定時は、解決の URL の org も token もその org のものになる。
+func TestSyncFromGcp_Repos_GhOrg_ResolvesInThatOrg(t *testing.T) {
+	_, _, pubB64 := genGhPubkey(t)
+	doer := &fakeHTTPDoer{}
+	doer.respond("GET https://api.github.com/repos/ohishi-exp/repo-a",
+		http.StatusOK, `{"id":303,"owner":{"login":"ohishi-exp"}}`)
+	doer.respond("GET https://api.github.com/orgs/ohishi-exp/actions/secrets/public-key",
+		http.StatusOK, `{"key_id":"kid-2","key":"`+pubB64+`"}`)
+	doer.respond("PUT https://api.github.com/orgs/ohishi-exp/actions/secrets/MY_SECRET",
+		http.StatusNoContent, "")
+	getter := &fakeSecretValueGetter{values: map[string]string{
+		"MY_SECRET": "v", "gh-token-ohishi-exp": "tok-ohishi",
+	}}
+	mux := newSyncExtraOrgTestMux(getter, doer)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, newSyncRequest(t,
+		"/sync-from-gcp/MY_SECRET?targets=gh&gh_org=ohishi-exp&visibility=selected&repos=repo-a&fail_if_exists=false"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(doer.calls) == 0 || doer.calls[0].URL.Path != "/repos/ohishi-exp/repo-a" {
+		t.Fatalf("first call = %v", doer.calls)
+	}
+	for _, c := range doer.calls {
+		if strings.Contains(c.URL.Path, "/ippoan/") {
+			t.Errorf("call went to default org: %s", c.URL)
+		}
+		if got := c.Header.Get("Authorization"); got != "Bearer tok-ohishi" {
+			t.Errorf("%s %s Authorization = %q", c.Method, c.URL, got)
+		}
+	}
+	bodies := syncPutBodies(t, doer)
+	if len(bodies) != 1 {
+		t.Fatalf("PUT count = %d", len(bodies))
+	}
+	var put struct {
+		SelectedRepositoryIDs []int64 `json:"selected_repository_ids"`
+	}
+	if err := json.Unmarshal(bodies[0], &put); err != nil {
+		t.Fatal(err)
+	}
+	if len(put.SelectedRepositoryIDs) != 1 || put.SelectedRepositoryIDs[0] != 303 {
+		t.Errorf("selected_repository_ids = %v", put.SelectedRepositoryIDs)
+	}
+}
+
+// App mode では repo の解決も installation token (App JWT ではない) で行う。
+func TestSyncFromGcp_Repos_AppMode_UsesInstallationToken(t *testing.T) {
+	_, _, pubB64 := genGhPubkey(t)
+	getter := appModeGetter(t)
+	getter.values["MY_SECRET"] = "v"
+	doer := appModeDoerForOrg("ippoan", "ghs_tok")
+	doer.respond("GET https://api.github.com/repos/ippoan/repo-a",
+		http.StatusOK, `{"id":404,"owner":{"login":"ippoan"}}`)
+	doer.respond("GET https://api.github.com/orgs/ippoan/actions/secrets/public-key",
+		http.StatusOK, `{"key_id":"kid-3","key":"`+pubB64+`"}`)
+	doer.respond("PUT https://api.github.com/orgs/ippoan/actions/secrets/MY_SECRET",
+		http.StatusNoContent, "")
+	mux := newGhAppModeMux(getter, doer)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, newSyncRequest(t,
+		"/sync-from-gcp/MY_SECRET?targets=gh&visibility=selected&repos=repo-a&fail_if_exists=false"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d body=%s", rec.Code, rec.Body.String())
+	}
+	seen := false
+	for _, c := range doer.calls {
+		if c.URL.Path == "/repos/ippoan/repo-a" {
+			seen = true
+			if got := c.Header.Get("Authorization"); got != "Bearer ghs_tok" {
+				t.Errorf("repo lookup Authorization = %q", got)
+			}
+		}
+	}
+	if !seen {
+		t.Fatal("repo lookup not made")
+	}
+}
+
+func TestParseSyncRepos(t *testing.T) {
+	got, err := parseSyncRepos(" repo-a , repo_b,,repo-a,Repo.C ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, "|") != "repo-a|repo_b|Repo.C" {
+		t.Errorf("got %v", got)
+	}
+	if got, err := parseSyncRepos(""); err != nil || len(got) != 0 {
+		t.Errorf("empty: got %v err=%v", got, err)
+	}
+	for _, bad := range []string{"a/b", "a b", ".", "..", "a?b", strings.Repeat("x", 101)} {
+		if _, err := parseSyncRepos(bad); err == nil {
+			t.Errorf("parseSyncRepos(%q): want error", bad)
+		}
 	}
 }

@@ -194,7 +194,7 @@ func handleConvertPkcs8(
 
 		// 4. optional GitHub propagate (upsert: fail_if_exists=false)。
 		if wantGh {
-			gr := propagateToGh(ctx, ghName, string(pkcs8), "all", false,
+			gr := propagateToGh(ctx, ghName, string(pkcs8), "all", nil, false,
 				ghCfg, valueGetter, httpClient, actor)
 			results["gh"] = gr
 			if gr.Status != "ok" {
